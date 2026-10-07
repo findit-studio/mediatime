@@ -836,4 +836,17 @@ quickcheck! {
   fn a_whole_number_parses_as_that_many_events_per_second(n: i32) -> bool {
     n.to_string().parse::<Rate>().ok() == Rate::try_hz(n)
   }
+
+  /// The float reading keeps the rate's order and its equality: correct
+  /// rounding is monotone, so a faster rate never reads slower, and equal
+  /// rates — however written — read the same double.
+  fn a_rates_float_keeps_its_order(a: (u32, u32), b: (u32, u32)) -> bool {
+    let (a, b) = (any_timebase(a), any_timebase(b));
+    let (a, b) = (Rate::fps(a.num(), a.den()), Rate::fps(b.num(), b.den()));
+    match a.cmp(&b) {
+      Ordering::Less => a.as_f64() <= b.as_f64(),
+      Ordering::Equal => a.as_f64() == b.as_f64(),
+      Ordering::Greater => a.as_f64() >= b.as_f64(),
+    }
+  }
 }

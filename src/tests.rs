@@ -2838,3 +2838,21 @@ fn the_degenerate_timebase_on_every_road() {
     Err(ParseSecondsError::DegenerateTimebase)
   );
 }
+
+#[test]
+fn a_rate_reads_as_the_double_nearest_it() {
+  assert_eq!(Rate::FPS_29_97.as_f64().to_string(), "29.97002997002997");
+  assert_eq!(Rate::FPS_23_976.as_f64().to_string(), "23.976023976023978");
+  assert_eq!(Rate::FPS_59_94.as_f64(), 60_000.0 / 1001.0);
+  assert_eq!(Rate::FPS_25.as_f64(), 25.0);
+  assert_eq!(Rate::hz(48_000).as_f64(), 48_000.0);
+  assert_eq!(Rate::hz(0).as_f64(), 0.0);
+  // Equal rates read the same float, however they are written.
+  assert_eq!(
+    Rate::fps(60_000, nz(2002)).as_f64(),
+    Rate::FPS_29_97.as_f64()
+  );
+  // And it is usable where a constant is.
+  const NTSC: f64 = Rate::FPS_29_97.as_f64();
+  const { assert!(NTSC > 29.97 && NTSC < 29.98) };
+}

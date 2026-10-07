@@ -136,6 +136,7 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// | the `cmp_semantic`s, [`Timestamp`]'s `==`, the [`TimeRange`] predicates | every count names instant zero, or measures zero |
 /// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
 /// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
+/// | [`Rate::as_f64`] | `0.0` |
 ///
 /// # Equality and ordering
 ///
@@ -3027,6 +3028,22 @@ impl Rate {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn saturating_frames_to_duration(&self, frames: i64) -> StdDuration {
     self.to_timebase().saturating_pts_to_duration(frames)
+  }
+
+  /// The rate as an `f64`, in events per second: `30000/1001` reads
+  /// `29.97002997002997`.
+  ///
+  /// **Lossy**, and for the places that need a float — a label, a pacing
+  /// loop, a format that stores a rate as a double. Most rates have no exact
+  /// binary fraction, so this is the double *nearest* the rational: exactly
+  /// that one, because both halves are exact in an `f64` and IEEE division
+  /// rounds correctly, so equal rates read the same float and a faster rate
+  /// never reads slower. Do not compute with it and convert back; the
+  /// rational is the value, and [`Self::num`] and [`Self::den`] hand it out.
+  /// The degenerate rate reads `0.0`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_f64(&self) -> f64 {
+    self.num() as f64 / self.den().get() as f64
   }
 }
 
