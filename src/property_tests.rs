@@ -592,4 +592,83 @@ quickcheck! {
       None => true,
     }
   }
+
+  /// Naming `Nearest` reproduces the rescale that names no rounding, for every
+  /// input — its refusals and the degenerate target included. This is the pin
+  /// that keeps `checked_rescale` on FFmpeg's rule while the named road is
+  /// built on a different division.
+  fn nearest_is_the_rescale_that_names_no_rounding(pts: i64, from: (u32, u32), to: (u32, u32), coarse: bool) -> bool {
+    let (from, to) = if coarse {
+      (coarse_timebase(from), coarse_timebase(to))
+    } else {
+      (any_timebase(from), any_timebase(to))
+    };
+    from.checked_rescale_with(pts, to, Rounding::Nearest) == from.checked_rescale(pts, to)
+  }
+
+  /// The tie, constructed rather than waited for — an odd count of
+  /// half-second ticks into whole seconds, at both signs — goes where
+  /// `checked_rescale` sends it: away from zero. Random draws reach an exact
+  /// tie too rarely to pin this (measured: a half-up rule passed the
+  /// property above).
+  fn nearest_breaks_ties_where_checked_rescale_does(pts: i64) -> bool {
+    let half_seconds = Timebase::new(1, nz(2));
+    let pts = pts | 1;
+    half_seconds.checked_rescale_with(pts, Timebase::SECONDS, Rounding::Nearest)
+      == half_seconds.checked_rescale(pts, Timebase::SECONDS)
+  }
+
+  /// Floor and ceiling bracket the exact quotient: they are one tick apart
+  /// unless it is whole, and then both are it — and nearest is one of the two.
+  fn floor_and_ceil_bracket_the_exact_quotient(pts: i64, from: (u32, u32), to: (u32, u32)) -> TestResult {
+    let (from, to) = (any_timebase(from), target_timebase(to));
+    let floor = from.checked_rescale_with(pts, to, Rounding::Floor);
+    let ceil = from.checked_rescale_with(pts, to, Rounding::Ceil);
+    let nearest = from.checked_rescale_with(pts, to, Rounding::Nearest);
+    let (Some(f), Some(c), Some(n)) = (floor, ceil, nearest) else {
+      return TestResult::discard();
+    };
+    let (num, den) = exact_quotient(pts, from, to);
+    let whole = num % den == 0;
+    TestResult::from_bool(
+      (f as i128) * den <= num
+        && num <= (c as i128) * den
+        && (c as i128) - (f as i128) == if whole { 0 } else { 1 }
+        && (n == f || n == c),
+    )
+  }
+
+  /// The typed roads are the count-level one under their own names, landing
+  /// in the timebase they were asked for.
+  fn the_typed_directed_rescales_agree_with_the_count(pts: i64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
+    let (from, to) = (any_timebase(from), any_timebase(to));
+    let rounding = [Rounding::Nearest, Rounding::Floor, Rounding::Ceil][which as usize % 3];
+    let count = from.checked_rescale_with(pts, to, rounding);
+    let instant = Timestamp::new(pts, from).checked_rescale_with(to, rounding);
+    let span = SignedDuration::new(pts, from).checked_rescale_with(to, rounding);
+    instant.map(|t| (t.pts(), t.timebase().is_identical(&to))) == count.map(|q| (q, true))
+      && span.map(|s| (s.ticks(), s.timebase().is_identical(&to))) == count.map(|q| (q, true))
+  }
+
+  /// An unsigned span rescales as the signed road does wherever both can hold
+  /// the answer, and past `i64::MAX` it keeps answering; under `Nearest` it is
+  /// `checked_rescale_to` over the whole `u64` range.
+  fn duration_directed_rescale_is_the_signed_road_with_twice_the_reach(ticks: u64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
+    let (from, to) = (any_timebase(from), any_timebase(to));
+    let rounding = [Rounding::Nearest, Rounding::Floor, Rounding::Ceil][which as usize % 3];
+    let span = Duration::new(ticks, from);
+    let named = span.checked_rescale_with(to, rounding).map(|d| d.ticks());
+    let nearest_is_the_rung = span.checked_rescale_with(to, Rounding::Nearest) == span.checked_rescale_to(to);
+    let agrees_with_signed = if ticks > i64::MAX as u64 {
+      true
+    } else {
+      match (from.checked_rescale_with(ticks as i64, to, rounding), named) {
+        (Some(q), Some(u)) => q >= 0 && q as u64 == u,
+        (None, Some(u)) => u > i64::MAX as u64,
+        (Some(_), None) => false,
+        (None, None) => true,
+      }
+    };
+    nearest_is_the_rung && agrees_with_signed
+  }
 }

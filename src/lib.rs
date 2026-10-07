@@ -559,6 +559,35 @@ impl Timebase {
     }
   }
 
+  /// Rescales `pts` from this timebase to `to`, rounding as `rounding` says,
+  /// or `None` if the answer is not an `i64`.
+  ///
+  /// [`Self::checked_rescale`] with the rounding named rather than fixed: the
+  /// exact quotient is formed the same way, in `i128` from the same operands,
+  /// and rounded once. Under [`Rounding::Nearest`] the two agree for every
+  /// input. Rescaling `1/1000` ticks into `1/3` ticks sends `400` to `1`
+  /// under [`Rounding::Floor`] and to `2` under [`Rounding::Ceil`], and `-400`
+  /// to `-2` and `-1`: floor and ceiling are directions on the number line,
+  /// whatever the sign.
+  ///
+  /// `None` covers what it covers for [`Self::checked_rescale`]: a quotient
+  /// outside `i64`'s range, and a degenerate `to` (`to.num() == 0`), which
+  /// names one instant and can count no other. A degenerate `self` is not a
+  /// failure: every count of it names instant zero, which lands on tick `0`
+  /// of any `to` under every rounding.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(&self, pts: i64, to: Self, rounding: Rounding) -> Option<i64> {
+    if to.num == 0 {
+      return None;
+    }
+    let numerator = (pts as i128) * (self.num as i128) * (to.den.get() as i128);
+    let denominator = (self.den.get() as i128) * (to.num as i128);
+    match div_rounded(numerator, denominator, rounding) {
+      Some(q) => i128_to_i64(q),
+      None => None,
+    }
+  }
+
   /// Converts a [`StdDuration`] into the number of ticks of this timebase that
   /// span it, or `None` if that count is not an `i64`.
   ///
@@ -774,6 +803,39 @@ impl fmt::Display for Timebase {
   }
 }
 
+/// Which way a value that falls between two ticks goes when it is counted in
+/// them.
+///
+/// A rescale that names no rounding rounds to [`Nearest`](Self::Nearest) —
+/// FFmpeg's default, and the rule [`Timebase::checked_rescale`] has always
+/// taken. The other variants are for the places where *nearest* is the wrong
+/// answer. A trim that must stay inside the stretch it was asked for lands its
+/// start on the first tick at or after the requested instant
+/// ([`Ceil`](Self::Ceil)) and its end on the last tick at or before it
+/// ([`Floor`](Self::Floor)); nearest would let either edge cross by up to half
+/// a tick.
+///
+/// [`Floor`](Self::Floor) and [`Ceil`](Self::Ceil) are directions on the
+/// number line, not toward or away from zero: `-1.5` ticks floors to `-2` and
+/// ceils to `-1`, as `-1.2` does. A value that lands on a tick is the same
+/// tick under every variant.
+///
+/// Marked `#[non_exhaustive]` because FFmpeg's `AVRounding` has more modes
+/// than these (`AV_ROUND_ZERO`, `AV_ROUND_INF`); naming one later must not
+/// break a `match` written against this list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Rounding {
+  /// To the nearest tick, halfway cases away from zero — FFmpeg's
+  /// `AV_ROUND_NEAR_INF`, and the rounding of every rescale that names none.
+  Nearest,
+  /// Toward negative infinity: the last tick at or before the value —
+  /// FFmpeg's `AV_ROUND_DOWN`.
+  Floor,
+  /// Toward positive infinity: the first tick at or after the value —
+  /// FFmpeg's `AV_ROUND_UP`.
+  Ceil,
+}
 /// A presentation timestamp, expressed as a PTS value in units of an associated [`Timebase`].
 ///
 /// # Equality and ordering
@@ -857,6 +919,26 @@ impl Timestamp {
     Self {
       pts: self.timebase.saturating_rescale(self.pts, target),
       timebase: target,
+    }
+  }
+
+  /// The same instant counted in `target`, rounded as `rounding` says, or
+  /// `None` where [`Timebase::checked_rescale_with`] has no answer.
+  ///
+  /// The road a trim takes: a start rescaled with [`Rounding::Ceil`] lands on
+  /// the first tick of `target` at or after it, an end rescaled with
+  /// [`Rounding::Floor`] on the last tick at or before it, so the trimmed
+  /// stretch stays inside the one asked for. `None` for a PTS outside `i64` in
+  /// `target`, and for a degenerate `target`, which can count no instant — the
+  /// refusals [`Self::rescale_to`] answers with a clamp and a panic.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(self, target: Timebase, rounding: Rounding) -> Option<Self> {
+    match self
+      .timebase
+      .checked_rescale_with(self.pts, target, rounding)
+    {
+      Some(pts) => Some(Self::new(pts, target)),
+      None => None,
     }
   }
 
@@ -1437,6 +1519,27 @@ impl SignedDuration {
     }
   }
 
+  /// Returns the same span counted in `target`, rounded as `rounding` says,
+  /// or `None` where [`Timebase::checked_rescale_with`] has no answer.
+  ///
+  /// [`Self::checked_rescale_to`] with the rounding named: under
+  /// [`Rounding::Nearest`] the two agree. A backward span floors and ceils on
+  /// the number line like any count, so `-1.5` ticks floors to `-2` — the
+  /// longer backward span — and ceils to `-1`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(self, target: Timebase, rounding: Rounding) -> Option<Self> {
+    match self
+      .timebase
+      .checked_rescale_with(self.ticks, target, rounding)
+    {
+      Some(ticks) => Some(Self {
+        ticks,
+        timebase: target,
+      }),
+      None => None,
+    }
+  }
+
   /// Compares two spans by the time they measure, rescaling if the timebases
   /// differ — the order this type deliberately has no [`Ord`] for, to be
   /// passed by name: `spans.sort_by(SignedDuration::cmp_semantic)`.
@@ -1684,6 +1787,29 @@ impl Duration {
         timebase: target,
       }),
       None => None,
+    }
+  }
+
+  /// Returns the same span counted in `target`, rounded as `rounding` says,
+  /// or `None` if the count is not a `u64` or `target` is degenerate.
+  ///
+  /// [`Self::checked_rescale_to`] with the rounding named, over the full
+  /// `u64` range that one covers: under [`Rounding::Nearest`] the two agree.
+  /// A degenerate `self.timebase()` measures zero, which is tick `0` of any
+  /// `target` under every rounding.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(self, target: Timebase, rounding: Rounding) -> Option<Self> {
+    if target.num == 0 {
+      return None;
+    }
+    let numerator = (self.ticks as u128) * (self.timebase.num as u128) * (target.den.get() as u128);
+    let denominator = (self.timebase.den.get() as u128) * (target.num as u128);
+    match div_rounded_unsigned(numerator, denominator, rounding) {
+      Some(q) if q <= u64::MAX as u128 => Some(Self {
+        ticks: q as u64,
+        timebase: target,
+      }),
+      _ => None,
     }
   }
 
@@ -2782,6 +2908,65 @@ const fn div_round_half_up(n: u128, d: u128) -> u128 {
   let q = n / d;
   let r = n % d;
   if 2 * r >= d { q + 1 } else { q }
+}
+
+/// `n / d` rounded as `rounding` says, for a strictly positive `d`.
+///
+/// Every arm starts from the floor quotient and its non-negative remainder —
+/// [`i128::div_euclid`] and [`i128::rem_euclid`], which for a positive
+/// divisor are the floor and what it leaves — so the sign of `n` needs no
+/// case analysis beyond the one tie rule.
+///
+/// The nearest arm compares `r` with `d - r` instead of doubling `r`, so it
+/// holds for every `d` up to `i128::MAX` and not only for the products of two
+/// `i32`s that [`div_round_half_away`] is bounded by. Where both apply they
+/// agree; a property test pins that for the whole rescale domain.
+///
+/// No arm overflows: a `q + 1` is only taken with `r > 0`, so `d >= 2` and
+/// `|q| <= |n| / 2`.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn div_rounded(n: i128, d: i128, rounding: Rounding) -> Option<i128> {
+  let q = n.div_euclid(d);
+  let r = n.rem_euclid(d);
+  match rounding {
+    Rounding::Floor => Some(q),
+    Rounding::Ceil => Some(if r == 0 { q } else { q + 1 }),
+    Rounding::Nearest => {
+      let rest = d - r;
+      Some(if r > rest || (r == rest && n >= 0) {
+        q + 1
+      } else {
+        q
+      })
+    }
+  }
+}
+
+/// [`div_rounded`] where both operands are non-negative, for the unsigned
+/// counts [`Duration`] carries: the floor is plain division, and "away from
+/// zero" is "up".
+///
+/// `d` must be non-zero. As in [`div_rounded`], a `q + 1` is only taken with
+/// `r > 0`, so it cannot overflow.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn div_rounded_unsigned(n: u128, d: u128, rounding: Rounding) -> Option<u128> {
+  let q = n / d;
+  let r = n % d;
+  match rounding {
+    Rounding::Floor => Some(q),
+    Rounding::Ceil => Some(if r == 0 { q } else { q + 1 }),
+    Rounding::Nearest => Some(if r >= d - r { q + 1 } else { q }),
+  }
+}
+
+/// `q` as an `i64`, or `None` outside its range.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn i128_to_i64(q: i128) -> Option<i64> {
+  if q > i64::MAX as i128 || q < i64::MIN as i128 {
+    None
+  } else {
+    Some(q as i64)
+  }
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]

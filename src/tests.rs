@@ -2130,3 +2130,208 @@ fn alternate_display_recovers_what_the_clock_drops() {
   assert_ne!(format!("{a:#}"), format!("{b:#}"));
   assert_ne!(format!("{a:?}"), format!("{b:?}"));
 }
+
+#[test]
+fn directed_rescale_rounds_the_named_way_at_ties_and_at_negative_values() {
+  // Milliseconds into thirds of a second: 400 ms is 1.2 ticks, 500 ms the
+  // tie 1.5, 600 ms 1.8 — and their mirrors below zero, where floor and
+  // ceiling keep their direction on the number line rather than flipping
+  // toward zero.
+  let ms = Timebase::MILLIS;
+  let thirds = Timebase::new(1, nz(3));
+  let table: [(i64, i64, i64, i64); 6] = [
+    // (pts, floor, ceil, nearest)
+    (400, 1, 2, 1),
+    (500, 1, 2, 2),
+    (600, 1, 2, 2),
+    (-400, -2, -1, -1),
+    (-500, -2, -1, -2),
+    (-600, -2, -1, -2),
+  ];
+  for (pts, floor, ceil, nearest) in table {
+    assert_eq!(
+      ms.checked_rescale_with(pts, thirds, Rounding::Floor),
+      Some(floor),
+      "floor of {pts} ms"
+    );
+    assert_eq!(
+      ms.checked_rescale_with(pts, thirds, Rounding::Ceil),
+      Some(ceil),
+      "ceil of {pts} ms"
+    );
+    assert_eq!(
+      ms.checked_rescale_with(pts, thirds, Rounding::Nearest),
+      Some(nearest),
+      "nearest of {pts} ms"
+    );
+  }
+
+  // On a tick every rounding agrees.
+  for (pts, ticks) in [(-1000, -3), (0, 0), (1000, 3)] {
+    for rounding in [Rounding::Nearest, Rounding::Floor, Rounding::Ceil] {
+      assert_eq!(ms.checked_rescale_with(pts, thirds, rounding), Some(ticks));
+    }
+  }
+}
+
+#[test]
+fn directed_rescale_round_trips_between_ntsc_frames_and_milliseconds() {
+  // A 29.97 fps frame lasts 1001/30 ms, so the frame → ms leg rounds for
+  // every frame but multiples of 30; the way back must still land on the
+  // frame it left, under each pair of directions that brackets it.
+  let frames = Timebase::NTSC_VIDEO;
+  let ms = Timebase::MILLIS;
+  let pairs = [
+    (Rounding::Floor, Rounding::Ceil),
+    (Rounding::Ceil, Rounding::Floor),
+    (Rounding::Nearest, Rounding::Nearest),
+  ];
+  for frame in (-3_000..=3_000).chain([i32::MAX as i64, -(i32::MAX as i64)]) {
+    for (there, back) in pairs {
+      let at = frames
+        .checked_rescale_with(frame, ms, there)
+        .expect("a frame count in i32 range is an i64 count of ms");
+      assert_eq!(
+        ms.checked_rescale_with(at, frames, back),
+        Some(frame),
+        "frame {frame} via {there:?} then {back:?}"
+      );
+    }
+  }
+
+  // Frame 1 is 33.366… ms.
+  assert_eq!(
+    frames.checked_rescale_with(1, ms, Rounding::Floor),
+    Some(33)
+  );
+  assert_eq!(frames.checked_rescale_with(1, ms, Rounding::Ceil), Some(34));
+  assert_eq!(
+    frames.checked_rescale_with(1, ms, Rounding::Nearest),
+    Some(33)
+  );
+}
+
+#[test]
+fn a_trim_lands_inside_the_stretch_it_was_asked_for() {
+  // [100 ms, 200 ms) trimmed onto a 29.97 fps timeline: 100 ms is 2.997
+  // frames and 200 ms is 5.994. The start ceils to 3 and the end floors to 5,
+  // both inside; nearest would put the end on frame 6, which is 200.2 ms.
+  let ms = Timebase::MILLIS;
+  let frames = Timebase::NTSC_VIDEO;
+  let (asked_start, asked_end) = (Timestamp::new(100, ms), Timestamp::new(200, ms));
+  let start = asked_start
+    .checked_rescale_with(frames, Rounding::Ceil)
+    .unwrap();
+  let end = asked_end
+    .checked_rescale_with(frames, Rounding::Floor)
+    .unwrap();
+  assert_eq!((start.pts(), end.pts()), (3, 5));
+  assert_eq!(start.timebase(), frames);
+  assert!(start >= asked_start && end <= asked_end);
+
+  let nearest_end = asked_end
+    .checked_rescale_with(frames, Rounding::Nearest)
+    .unwrap();
+  assert_eq!(nearest_end.pts(), 6);
+  assert!(nearest_end > asked_end);
+}
+
+#[test]
+fn directed_rescale_of_spans_keeps_the_sign_on_the_count() {
+  // -500 ms is -1.5 thirds of a second: the floor is the longer backward
+  // span, the ceiling the shorter one.
+  let thirds = Timebase::new(1, nz(3));
+  let back = SignedDuration::new(-500, Timebase::MILLIS);
+  assert_eq!(
+    back.checked_rescale_with(thirds, Rounding::Floor),
+    Some(SignedDuration::new(-2, thirds))
+  );
+  assert_eq!(
+    back.checked_rescale_with(thirds, Rounding::Ceil),
+    Some(SignedDuration::new(-1, thirds))
+  );
+  assert_eq!(
+    back.checked_rescale_with(thirds, Rounding::Nearest),
+    back.checked_rescale_to(thirds)
+  );
+
+  let forward = Duration::new(500, Timebase::MILLIS);
+  assert_eq!(
+    forward.checked_rescale_with(thirds, Rounding::Floor),
+    Some(Duration::new(1, thirds))
+  );
+  assert_eq!(
+    forward.checked_rescale_with(thirds, Rounding::Ceil),
+    Some(Duration::new(2, thirds))
+  );
+  assert_eq!(
+    forward.checked_rescale_with(thirds, Rounding::Nearest),
+    forward.checked_rescale_to(thirds)
+  );
+}
+
+#[test]
+fn directed_rescale_refuses_what_its_count_cannot_hold() {
+  for rounding in [Rounding::Nearest, Rounding::Floor, Rounding::Ceil] {
+    // i64::MAX seconds is past i64 in milliseconds, whichever way it rounds.
+    assert_eq!(
+      Timebase::SECONDS.checked_rescale_with(i64::MAX, Timebase::MILLIS, rounding),
+      None
+    );
+    assert_eq!(
+      Timestamp::new(i64::MIN, Timebase::SECONDS).checked_rescale_with(Timebase::MILLIS, rounding),
+      None
+    );
+    // A `Duration` reaches twice as far before it refuses.
+    assert_eq!(
+      Duration::new(u64::MAX, Timebase::MILLIS)
+        .checked_rescale_with(Timebase::SECONDS, rounding)
+        .map(|d| d.ticks() / 1_000_000_000_000_000),
+      Some(18)
+    );
+    assert_eq!(
+      Duration::new(u64::MAX, Timebase::SECONDS).checked_rescale_with(Timebase::MILLIS, rounding),
+      None
+    );
+  }
+}
+
+#[test]
+fn directed_rescale_and_the_degenerate_timebase() {
+  let zero = Timebase::new(0, nz(7));
+  for rounding in [Rounding::Nearest, Rounding::Floor, Rounding::Ceil] {
+    // A degenerate target names one instant and can count no other: refused
+    // on every road, as `checked_rescale` refuses it — zero included.
+    assert_eq!(
+      Timebase::MILLIS.checked_rescale_with(0, zero, rounding),
+      None
+    );
+    assert_eq!(
+      Timestamp::new(5, Timebase::MILLIS).checked_rescale_with(zero, rounding),
+      None
+    );
+    assert_eq!(
+      SignedDuration::new(-5, Timebase::MILLIS).checked_rescale_with(zero, rounding),
+      None
+    );
+    assert_eq!(
+      Duration::new(5, Timebase::MILLIS).checked_rescale_with(zero, rounding),
+      None
+    );
+
+    // A degenerate source names instant zero whatever its count, and zero is
+    // tick 0 of any target under every rounding.
+    assert_eq!(
+      zero.checked_rescale_with(i64::MAX, Timebase::MILLIS, rounding),
+      Some(0)
+    );
+    assert_eq!(
+      zero.checked_rescale_with(i64::MIN, Timebase::MILLIS, rounding),
+      Some(0)
+    );
+    assert_eq!(
+      Duration::new(u64::MAX, zero).checked_rescale_with(Timebase::MILLIS, rounding),
+      Some(Duration::new(0, Timebase::MILLIS))
+    );
+  }
+}
