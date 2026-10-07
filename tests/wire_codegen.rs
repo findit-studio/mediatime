@@ -154,6 +154,13 @@ fn generated() -> Vec<(String, String)> {
   .collect()
 }
 
+/// The two texts with their line endings normalized: a checkout that turns
+/// LF into CRLF — git's `core.autocrlf`, on by default on Windows — changes
+/// the bytes of a file but not one line of its code.
+fn same_text(checked_in: &str, generated: &str) -> bool {
+  checked_in.replace("\r\n", "\n") == generated.replace("\r\n", "\n")
+}
+
 #[test]
 fn the_checked_in_code_is_what_buffa_codegen_writes() {
   let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/codegen");
@@ -171,10 +178,18 @@ fn the_checked_in_code_is_what_buffa_codegen_writes() {
     }
     let checked_in = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
     assert!(
-      checked_in == content,
+      same_text(&checked_in, &content),
       "{name} is not what buffa-codegen writes today; rerun with MEDIATIME_BLESS=1"
     );
   }
+}
+
+#[test]
+fn a_crlf_checkout_reads_as_the_same_code() {
+  // What a Windows checkout of the LF copy holds, and a real difference.
+  let lf = "fn a() {}\nfn b() {}\n";
+  assert!(same_text(&lf.replace('\n', "\r\n"), lf));
+  assert!(!same_text("fn a() {}\r\nfn c() {}\r\n", lf));
 }
 
 fn nz(n: i32) -> NonZeroI32 {
