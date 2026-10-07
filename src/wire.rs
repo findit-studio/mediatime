@@ -447,7 +447,10 @@ impl Message for TimeRange {
 /// occurrence through `merge_into_view`, measures and writes it through
 /// `ViewEncode`, and reaches an unset one through `DefaultViewInstance`; all
 /// four forward to the owned `Message` impl. `merge_into_view` merges the
-/// whole sub-message at once, as `Message::merge` does.
+/// whole sub-message at once, as `Message::merge` does, and
+/// `decode_view_with_ctx` keeps the `DecodeContext` it is handed, so a
+/// caller's `DecodeOptions` limits hold for these views as they do for the
+/// generated ones.
 macro_rules! scalar_view {
   ($ty:ty) => {
     impl<'a> ::buffa::MessageView<'a> for $ty {
@@ -455,6 +458,12 @@ macro_rules! scalar_view {
 
       fn decode_view(buf: &'a [u8]) -> Result<Self, DecodeError> {
         <$ty as Message>::decode_from_slice(buf)
+      }
+
+      // `DecodeOptions` calls this with the caller's limits; the default would
+      // drop them and start over through `decode_view`'s.
+      fn decode_view_with_ctx(buf: &'a [u8], ctx: DecodeContext<'_>) -> Result<Self, DecodeError> {
+        <$ty as ::buffa::MessageView<'a>>::decode_view_ctx(buf, ctx)
       }
 
       fn merge_into_view(

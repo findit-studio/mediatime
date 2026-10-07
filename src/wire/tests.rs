@@ -397,3 +397,33 @@ quickcheck::quickcheck! {
       && decoded.ok().map(TimeRange::from) == Some(wire)
   }
 }
+
+#[test]
+fn a_view_keeps_the_callers_decode_limits() {
+  // A timestamp whose timebase field is one nesting level down: no depth to
+  // spare refuses it, through the view as through the message.
+  let bytes = [0x12, 0x00];
+  let none = buffa::DecodeOptions::new().with_recursion_limit(0);
+  assert!(matches!(
+    none.decode_view::<Timestamp>(&bytes),
+    Err(DecodeError::RecursionLimitExceeded)
+  ));
+  assert!(matches!(
+    none.decode::<Timestamp>(&mut bytes.as_slice()),
+    Err(DecodeError::RecursionLimitExceeded)
+  ));
+  assert!(matches!(
+    none.decode_view::<TimeRange>(&[0x1a, 0x00]),
+    Err(DecodeError::RecursionLimitExceeded)
+  ));
+
+  // One level is enough.
+  let one = buffa::DecodeOptions::new().with_recursion_limit(1);
+  assert_eq!(
+    one.decode_view::<Timestamp>(&bytes).ok(),
+    Some(Timestamp {
+      pts: 0,
+      timebase: Some(Timebase::default()),
+    })
+  );
+}
