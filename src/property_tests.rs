@@ -642,7 +642,12 @@ quickcheck! {
   /// in the timebase they were asked for.
   fn the_typed_directed_rescales_agree_with_the_count(pts: i64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
     let (from, to) = (any_timebase(from), any_timebase(to));
-    let rounding = [Rounding::Nearest, Rounding::Floor, Rounding::Ceil][which as usize % 3];
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
     let count = from.checked_rescale_with(pts, to, rounding);
     let instant = Timestamp::new(pts, from).checked_rescale_with(to, rounding);
     let span = SignedDuration::new(pts, from).checked_rescale_with(to, rounding);
@@ -655,7 +660,12 @@ quickcheck! {
   /// `checked_rescale_to` over the whole `u64` range.
   fn duration_directed_rescale_is_the_signed_road_with_twice_the_reach(ticks: u64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
     let (from, to) = (any_timebase(from), any_timebase(to));
-    let rounding = [Rounding::Nearest, Rounding::Floor, Rounding::Ceil][which as usize % 3];
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
     let span = Duration::new(ticks, from);
     let named = span.checked_rescale_with(to, rounding).map(|d| d.ticks());
     let nearest_is_the_rung = span.checked_rescale_with(to, Rounding::Nearest) == span.checked_rescale_to(to);
@@ -678,7 +688,12 @@ quickcheck! {
   /// changes nothing for a sum of one.
   fn one_term_read_back_is_the_directed_rescale(ticks: i64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
     let (from, to) = (any_timebase(from), any_timebase(to));
-    let rounding = [Rounding::Nearest, Rounding::Floor, Rounding::Ceil][which as usize % 3];
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
     let span = SignedDuration::new(ticks, from);
     ExactSeconds::from_signed_duration(span).checked_to_signed_duration(to, rounding)
       == span.checked_rescale_with(to, rounding)
@@ -724,5 +739,33 @@ quickcheck! {
     TestResult::from_bool(
       f_s <= sum && sum <= c_s && (c.ticks() as i128) - (f.ticks() as i128) == if on_a_tick { 0 } else { 1 },
     )
+  }
+
+  /// The exact rescale answers exactly when floor and ceiling agree, and then
+  /// it is both; otherwise it refuses. Tiny timebases make whole quotients
+  /// common enough to reach the answering arm.
+  fn exact_answers_when_floor_is_ceil(pts: i64, small: i16, from: (u32, u32), to: (u32, u32), coarse: bool) -> bool {
+    let (pts, from, to) = if coarse {
+      (small as i64, coarse_timebase(from), coarse_timebase(to))
+    } else {
+      (pts, any_timebase(from), any_timebase(to))
+    };
+    let floor = from.checked_rescale_with(pts, to, Rounding::Floor);
+    let ceil = from.checked_rescale_with(pts, to, Rounding::Ceil);
+    let exact = from.checked_rescale_exact(pts, to);
+    match (floor, ceil) {
+      (Some(f), Some(c)) if f == c => exact == Some(f),
+      _ => exact.is_none(),
+    }
+  }
+
+  /// An exact answer is a round trip: rescaling it back is exact too, and
+  /// returns the count it came from.
+  fn an_exact_rescale_round_trips(small: i16, from: (u32, u32), to: (u32, u32)) -> bool {
+    let (pts, from, to) = (small as i64, coarse_timebase(from), coarse_timebase(to));
+    match from.checked_rescale_exact(pts, to) {
+      Some(q) if from.num() != 0 => to.checked_rescale_exact(q, from) == Some(pts),
+      _ => true,
+    }
   }
 }

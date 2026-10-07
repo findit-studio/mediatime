@@ -2546,3 +2546,85 @@ fn exact_seconds_order_is_the_order_of_the_numbers() {
   assert!(a.den().get() > (1_i128 << 90));
   assert!(a < b && b > a && a.cmp(&b) == Ordering::Less);
 }
+
+#[test]
+fn exact_rescale_answers_only_when_no_rounding_occurs() {
+  let ms = Timebase::MILLIS;
+  let mpeg = Timebase::MPEG_90K;
+  let ntsc = Timebase::NTSC_VIDEO;
+
+  // A millisecond is 90 MPEG ticks; an MPEG tick is no whole millisecond.
+  assert_eq!(ms.checked_rescale_exact(1, mpeg), Some(90));
+  assert_eq!(mpeg.checked_rescale_exact(1, ms), None);
+  assert_eq!(mpeg.checked_rescale_exact(90, ms), Some(1));
+  assert_eq!(mpeg.checked_rescale_exact(-90, ms), Some(-1));
+
+  // Thirty 29.97 fps frames are 1001 ms exactly; one frame is 33.366… ms.
+  assert_eq!(ntsc.checked_rescale_exact(30, ms), Some(1001));
+  assert_eq!(ntsc.checked_rescale_exact(-30, ms), Some(-1001));
+  assert_eq!(ntsc.checked_rescale_exact(1, ms), None);
+  assert_eq!(ms.checked_rescale_exact(1001, ntsc), Some(30));
+  assert_eq!(ms.checked_rescale_exact(1000, ntsc), None);
+
+  // It is the named rounding, and it still refuses what i64 cannot hold.
+  assert_eq!(
+    ntsc.checked_rescale_exact(30, ms),
+    ntsc.checked_rescale_with(30, ms, Rounding::Exact)
+  );
+  assert_eq!(Timebase::SECONDS.checked_rescale_exact(i64::MAX, ms), None);
+
+  // A degenerate target is refused, even for zero; a degenerate source names
+  // instant zero, which is tick 0 exactly.
+  let zero = Timebase::new(0, nz(5));
+  assert_eq!(ms.checked_rescale_exact(0, zero), None);
+  assert_eq!(zero.checked_rescale_exact(12_345, ms), Some(0));
+
+  // The typed roads, under the named rounding.
+  assert_eq!(
+    Timestamp::new(30, ntsc).checked_rescale_with(ms, Rounding::Exact),
+    Some(Timestamp::new(1001, ms))
+  );
+  assert_eq!(
+    Timestamp::new(1, ntsc).checked_rescale_with(ms, Rounding::Exact),
+    None
+  );
+  assert_eq!(
+    SignedDuration::new(-1, mpeg).checked_rescale_with(ms, Rounding::Exact),
+    None
+  );
+  assert_eq!(
+    Duration::new(90, mpeg).checked_rescale_with(ms, Rounding::Exact),
+    Some(Duration::new(1, ms))
+  );
+  assert_eq!(
+    Duration::new(91, mpeg).checked_rescale_with(ms, Rounding::Exact),
+    None
+  );
+}
+
+#[test]
+fn exact_seconds_read_back_exactly_or_not_at_all() {
+  // 1001 ms and one 29.97 fps frame: 1034.366… ms, but exactly 31 frames.
+  let ms = Timebase::MILLIS;
+  let ntsc = Timebase::NTSC_VIDEO;
+  let total = ExactSeconds::from_signed_duration(SignedDuration::new(1001, ms))
+    .checked_add(ExactSeconds::from_signed_duration(SignedDuration::new(
+      1, ntsc,
+    )))
+    .unwrap();
+  assert_eq!(total.checked_to_signed_duration(ms, Rounding::Exact), None);
+  assert_eq!(total.checked_to_timestamp(ms, Rounding::Exact), None);
+  assert_eq!(total.checked_to_duration(ms, Rounding::Exact), None);
+  assert_eq!(
+    total.checked_to_signed_duration(ntsc, Rounding::Exact),
+    Some(SignedDuration::new(31, ntsc))
+  );
+  assert_eq!(
+    total.checked_to_timestamp(ntsc, Rounding::Exact),
+    Some(Timestamp::new(31, ntsc))
+  );
+  assert_eq!(
+    total.checked_to_duration(ntsc, Rounding::Exact),
+    Some(Duration::new(31, ntsc))
+  );
+}

@@ -585,9 +585,11 @@ impl Timebase {
   ///
   /// `None` covers what it covers for [`Self::checked_rescale`]: a quotient
   /// outside `i64`'s range, and a degenerate `to` (`to.num() == 0`), which
-  /// names one instant and can count no other. A degenerate `self` is not a
-  /// failure: every count of it names instant zero, which lands on tick `0`
-  /// of any `to` under every rounding.
+  /// names one instant and can count no other. Under [`Rounding::Exact`] it
+  /// also covers a quotient that falls between two ticks — see
+  /// [`Self::checked_rescale_exact`]. A degenerate `self` is not a failure:
+  /// every count of it names instant zero, which lands on tick `0` of any
+  /// `to` under every rounding, exactly.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checked_rescale_with(&self, pts: i64, to: Self, rounding: Rounding) -> Option<i64> {
     if to.num == 0 {
@@ -599,6 +601,25 @@ impl Timebase {
       Some(q) => i128_to_i64(q),
       None => None,
     }
+  }
+
+  /// Rescales `pts` from this timebase to `to` only if no rounding occurs:
+  /// `Some` exactly when the instant lands on a tick of `to`, and fits an
+  /// `i64` there.
+  ///
+  /// [`Self::checked_rescale_with`] under [`Rounding::Exact`]. One millisecond
+  /// is 90 ticks of [`MPEG_90K`](Self::MPEG_90K), so `1` rescales; one MPEG
+  /// tick is a ninetieth of a millisecond, so it does not. Thirty 29.97 fps
+  /// frames are exactly 1001 ms, while one frame is 33.366… ms and has no
+  /// millisecond count.
+  ///
+  /// An answer here is a round trip: rescaling it back is exact too, and
+  /// returns `pts` — unless `self` is degenerate, which no rescale can land
+  /// in. A degenerate `to` is refused as it is everywhere; a degenerate
+  /// `self` answers `0`, its every count naming instant zero.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_exact(&self, pts: i64, to: Self) -> Option<i64> {
+    self.checked_rescale_with(pts, to, Rounding::Exact)
   }
 
   /// Converts a [`StdDuration`] into the number of ticks of this timebase that
@@ -848,6 +869,10 @@ pub enum Rounding {
   /// Toward positive infinity: the first tick at or after the value —
   /// FFmpeg's `AV_ROUND_UP`.
   Ceil,
+  /// No rounding at all: a value that falls between two ticks is refused,
+  /// and only one that lands on a tick is answered. The exact-or-none road,
+  /// for a caller that would rather know than approximate.
+  Exact,
 }
 /// A presentation timestamp, expressed as a PTS value in units of an associated [`Timebase`].
 ///
@@ -2165,10 +2190,11 @@ impl ExactSeconds {
   /// `rounding` says, or `None` if the count is not an `i64` or `timebase` is
   /// degenerate.
   ///
-  /// The one rounding a total built here goes through. A degenerate
-  /// `timebase` (`num() == 0`) names one instant and can count no other, so
-  /// it is refused under every rounding, as [`Timebase::checked_rescale`]
-  /// refuses it.
+  /// The one rounding a total built here goes through — or none, under
+  /// [`Rounding::Exact`], which answers only seconds that land on a tick. A
+  /// degenerate `timebase` (`num() == 0`) names one instant and can count no
+  /// other, so it is refused under every rounding, as
+  /// [`Timebase::checked_rescale`] refuses it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checked_to_timestamp(
     self,
@@ -2189,7 +2215,8 @@ impl ExactSeconds {
   /// degenerate.
   ///
   /// A negative number of seconds is a backward span, and floors and ceils on
-  /// the number line as any count does.
+  /// the number line as any count does. Under [`Rounding::Exact`], seconds
+  /// that fall between two ticks are refused.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checked_to_signed_duration(
     self,
@@ -2210,7 +2237,8 @@ impl ExactSeconds {
   /// `u64::MAX`, or `timebase` is degenerate.
   ///
   /// The rounded count decides, not the sign of the seconds: `-0.4` ticks
-  /// ceils to a zero-length span, which a [`Duration`] holds.
+  /// ceils to a zero-length span, which a [`Duration`] holds. Under
+  /// [`Rounding::Exact`], seconds that fall between two ticks are refused.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn checked_to_duration(
     self,
@@ -3248,7 +3276,8 @@ const fn div_round_half_up(n: u128, d: u128) -> u128 {
   if 2 * r >= d { q + 1 } else { q }
 }
 
-/// `n / d` rounded as `rounding` says, for a strictly positive `d`.
+/// `n / d` rounded as `rounding` says, for a strictly positive `d` — `None`
+/// only where [`Rounding::Exact`] meets a quotient that is not whole.
 ///
 /// Every arm starts from the floor quotient and its non-negative remainder —
 /// [`i128::div_euclid`] and [`i128::rem_euclid`], which for a positive
@@ -3269,6 +3298,13 @@ const fn div_rounded(n: i128, d: i128, rounding: Rounding) -> Option<i128> {
   match rounding {
     Rounding::Floor => Some(q),
     Rounding::Ceil => Some(if r == 0 { q } else { q + 1 }),
+    Rounding::Exact => {
+      if r == 0 {
+        Some(q)
+      } else {
+        None
+      }
+    }
     Rounding::Nearest => {
       let rest = d - r;
       Some(if r > rest || (r == rest && n >= 0) {
@@ -3284,7 +3320,8 @@ const fn div_rounded(n: i128, d: i128, rounding: Rounding) -> Option<i128> {
 /// counts [`Duration`] carries: the floor is plain division, and "away from
 /// zero" is "up".
 ///
-/// `d` must be non-zero. As in [`div_rounded`], a `q + 1` is only taken with
+/// `d` must be non-zero, and `None` again means only an inexact quotient under
+/// [`Rounding::Exact`]. As in [`div_rounded`], a `q + 1` is only taken with
 /// `r > 0`, so it cannot overflow.
 #[cfg_attr(not(tarpaulin), inline(always))]
 const fn div_rounded_unsigned(n: u128, d: u128, rounding: Rounding) -> Option<u128> {
@@ -3294,6 +3331,13 @@ const fn div_rounded_unsigned(n: u128, d: u128, rounding: Rounding) -> Option<u1
     Rounding::Floor => Some(q),
     Rounding::Ceil => Some(if r == 0 { q } else { q + 1 }),
     Rounding::Nearest => Some(if r >= d - r { q + 1 } else { q }),
+    Rounding::Exact => {
+      if r == 0 {
+        Some(q)
+      } else {
+        None
+      }
+    }
   }
 }
 
