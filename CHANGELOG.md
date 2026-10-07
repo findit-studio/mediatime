@@ -6,6 +6,69 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1]
+
+### Added
+
+- `Rounding { Nearest, Floor, Ceil, Exact }` (`#[non_exhaustive]`) — which
+  way a value that falls between two ticks goes. `Nearest` is FFmpeg's
+  `AV_ROUND_NEAR_INF`, the rule every rescale that names none keeps;
+  `Floor` and `Ceil` are directions on the number line at either sign;
+  `Exact` refuses a value between ticks.
+- Directed rescales: `Timebase::checked_rescale_with(pts, to, rounding)`,
+  and `checked_rescale_with(target, rounding)` on `Timestamp`,
+  `SignedDuration` and `Duration` (the last over its full `u64` range).
+  `checked_rescale` is unchanged; a property pins that naming `Nearest`
+  reproduces it for every input.
+- `Timebase::checked_rescale_exact(pts, to)` — the exact-or-none rescale:
+  `Some` only when the instant lands on a tick of `to`, and an answer
+  rescales back exactly.
+- `ExactSeconds` — an exact, signed number of seconds (`i128` over a
+  positive `i128`, in lowest terms): the sum across timebases that does not
+  round, where `SignedDuration::checked_add` rescales its right operand to
+  the nearest tick. `from_timestamp`/`from_signed_duration`/`from_duration`
+  fold in exactly; `checked_add`/`checked_sub` stay exact or answer `None`;
+  `checked_to_timestamp`/`checked_to_signed_duration`/`checked_to_duration`
+  read the total back once, by a `Rounding`. `Ord` compares by Euclid's
+  algorithm, so denominators whose cross product leaves `i128` still order
+  exactly.
+- `TimeRange::{contains_instant, contains, overlaps, within, before,
+  after}` — ingraph's `MediaTimeRangeFilter` algebra in memory, operator for
+  operator, compared exactly across timebases. The type's docs carry the
+  table and every degenerate case: an instant at `start` and at `end`,
+  abutting ranges, zero-length ranges, a range in a degenerate timebase.
+- `Timestamp::parse_seconds(text, timebase, rounding)` — decimal seconds
+  read exactly, as integers rather than through a float, and counted in
+  `timebase` by the rounding named. `ParseSecondsError` (`#[non_exhaustive]`:
+  `NotDecimal`, `BetweenTicks`, `OutOfRange`, `DegenerateTimebase`) says
+  why a text was refused — `BetweenTicks` is the refusal by name under
+  `Rounding::Exact`.
+- `Rate::as_f64` — the double nearest a rate, for the places that need a
+  float; lossy, and documented as such.
+
+### Changed
+
+- `Rate`'s `FromStr` also reads a whole number of events per second:
+  `"25"` is `25/1`, through `Rate::try_hz`. A decimal rate stays refused
+  (`23.976` is not `24000/1001`), and `Timebase`'s door still takes no bare
+  number. `ParseRateError`'s message names the new arm.
+
+### Fixed
+
+- The `buffa` decoder refuses a `TimeRange` whose `end` precedes its
+  `start`, with `DecodeError::Custom`, instead of admitting one whose
+  `duration()` then panicked. The order is judged once the whole message is
+  merged — in `merge_to_limit` and `merge_group`, where every decode road
+  ends — so a peer may still send `start` first; a merge that fails leaves
+  the value as it was.
+- Documentation: a zero `Timebase` numerator stays legal — `0/1` is
+  libavformat's "undeclared" timebase, and every reader accepts what the
+  constructors build — and `Timebase`'s docs now say what every road does
+  with one. `Timestamp::duration` states its answer for a degenerate
+  timebase (zero, for any count), and `TimeRange::duration`'s panic docs
+  name the endpoint setters, which assign without checking, as the one
+  remaining way to build an inverted range.
+
 ## [0.4.0] - 2026-08-27
 
 ### Added

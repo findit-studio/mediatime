@@ -57,7 +57,7 @@ impl core::error::Error for ParseTimebaseError {}
 /// Returned when a string is not a [`Timestamp`] rendering.
 ///
 /// Also returned for the readable `H:MM:SS.mmm` clock form, which is lossy
-/// and therefore not parsed — see the [module docs](self).
+/// and therefore not parsed — see [`Timestamp`]'s `Display` impl.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseTimestampError(());
 
