@@ -2754,3 +2754,87 @@ fn a_range_in_a_degenerate_timebase_is_the_zero_length_range_at_zero() {
   assert!(r.within(&TimeRange::new(0, 0, ms)) && r.contains(&TimeRange::new(0, 0, ms)));
   assert!(r.before(&Timestamp::new(0, ms)) && r.after(&Timestamp::new(0, ms)));
 }
+
+#[test]
+fn the_degenerate_timebase_on_every_road() {
+  // One law per row of `Timebase`'s "every road" table.
+  let zero = Timebase::new(0, nz(7));
+  let ms = Timebase::MILLIS;
+
+  // Legal: equal to every other `0/den`, below every other timebase, hashed
+  // alike, and back through its text.
+  assert_eq!(zero, Timebase::new(0, nz(1)));
+  assert!(zero < Timebase::new(1, nz(i32::MAX)));
+  assert_eq!(hash_of(&zero), hash_of(&Timebase::new(0, nz(1))));
+  let text: Timebase = format!("{zero}").parse().unwrap();
+  assert_eq!((text.num(), text.den().get()), (0, 7));
+
+  // Into it: refused by the checked rung; within one identical degenerate
+  // timebase, arithmetic stays exact.
+  assert_eq!(ms.checked_rescale(5, zero), None);
+  assert_eq!(
+    Timestamp::new(5, ms).checked_rescale_with(zero, Rounding::Exact),
+    None
+  );
+  assert_eq!(
+    SignedDuration::new(2, zero).checked_add(SignedDuration::new(3, zero)),
+    Some(SignedDuration::new(5, zero))
+  );
+
+  // Out of it: tick 0.
+  assert_eq!(zero.checked_rescale(i64::MAX, ms), Some(0));
+  assert_eq!(
+    Timestamp::new(-9, zero).rescale_to(ms),
+    Timestamp::new(0, ms)
+  );
+
+  // The `StdDuration` conversions.
+  assert_eq!(
+    zero.checked_duration_to_pts(StdDuration::from_secs(1)),
+    None
+  );
+  assert_eq!(
+    Duration::checked_from_std(StdDuration::from_secs(1), zero),
+    None
+  );
+  assert_eq!(zero.checked_pts_to_duration(9), Some(StdDuration::ZERO));
+  assert_eq!(
+    zero.checked_pts_to_duration(-9),
+    None,
+    "refused for its sign"
+  );
+  assert_eq!(
+    Duration::new(9, zero).checked_to_std(),
+    Some(StdDuration::ZERO)
+  );
+  assert_eq!(Timestamp::new(-9, zero).duration(), Some(StdDuration::ZERO));
+
+  // No reciprocal.
+  assert_eq!(zero.checked_recip(), None);
+  assert_eq!(Rate::checked_from_timebase(zero), None);
+  assert_eq!(Rate::hz(0).checked_to_timebase(), None);
+  assert_eq!(Rate::hz(0).checked_frames_to_duration(1), None);
+
+  // Comparisons read instant zero.
+  assert_eq!(Timestamp::new(5, zero), Timestamp::new(0, ms));
+  assert!(
+    SignedDuration::new(5, zero)
+      .cmp_semantic(&SignedDuration::new(0, ms))
+      .is_eq()
+  );
+  assert!(!TimeRange::new(1, 9, zero).contains_instant(&Timestamp::new(0, ms)));
+
+  // Exact seconds, and parsing.
+  assert_eq!(
+    ExactSeconds::from_timestamp(Timestamp::new(5, zero)),
+    ExactSeconds::ZERO
+  );
+  assert_eq!(
+    ExactSeconds::ZERO.checked_to_timestamp(zero, Rounding::Nearest),
+    None
+  );
+  assert_eq!(
+    Timestamp::parse_seconds("0", zero, Rounding::Nearest),
+    Err(ParseSecondsError::DegenerateTimebase)
+  );
+}

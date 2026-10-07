@@ -269,3 +269,19 @@ const fn nz(n: i32) -> NonZeroI32 {
     None => panic!("zero"),
   }
 }
+
+#[test]
+fn a_zero_numerator_reads_back_as_it_was_built() {
+  // Read == construct: `Timebase::new` builds `0/den`, so the reader takes it,
+  // at any denominator and as written — and through `Rate`'s transparent face
+  // too, where it is the degenerate rate.
+  for den in [1, 3, 1001, i32::MAX] {
+    let read = de(0, den).expect("a zero numerator is read");
+    assert_eq!((read.num(), read.den().get()), (0, den));
+  }
+  let rate = Rate::deserialize(MapDeserializer::<_, Error>::new(
+    [("numerator", 0), ("denominator", 1)].into_iter(),
+  ))
+  .expect("the degenerate rate is read");
+  assert_eq!((rate.num(), rate.den().get()), (0, 1));
+}

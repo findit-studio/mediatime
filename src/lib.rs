@@ -110,6 +110,33 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// guarantee, and `AVRational` is laxer than this crate needs because it also
 /// serves aspect ratios. Here it is a type-level guarantee instead.
 ///
+/// ## Why a zero numerator is legal
+///
+/// A `0/den` timebase measures nothing — every tick of it is zero seconds —
+/// and it is still a value this type holds, for two reasons. `0/1` is what
+/// libavformat leaves in a stream's `time_base` when the container declared
+/// none, so a reader that reports a stream's timebase as declared has to be
+/// able to say it. And every way in reads what construction accepts, no more
+/// and no less: serde's `Deserialize` refuses a negative numerator because
+/// [`Self::new`] does, and reads a zero one because [`Self::new`] builds it,
+/// so a value this crate writes always reads back. A field where zero cannot
+/// mean "undeclared" — a frame rate, a document that requires a real ruler —
+/// refuses it there, where that rule belongs.
+///
+/// Every road states what it does with one:
+///
+/// | road | with a zero numerator |
+/// |---|---|
+/// | construction, `==`, [`Ord`], [`Hash`], `Display`, `FromStr`, serde, `buffa` | legal: every `0/den` equals every other, sorts below every other timebase, and round-trips |
+/// | a rescale *into* it — the rescale ladders, every type's `rescale_to`, `checked_rescale_to` and `checked_rescale_with`, and the span and shift arithmetic that recounts an operand into it | the `checked_` rung answers `None` and the saturating rung panics, as a zero divisor does; arithmetic within one identical degenerate timebase recounts nothing and stays exact |
+/// | a rescale *out of* it | tick `0`: every count of it names instant zero |
+/// | [`checked_duration_to_pts`](Self::checked_duration_to_pts), [`Duration::checked_from_std`], and their saturating twins | `None`, and a panic |
+/// | [`checked_pts_to_duration`](Self::checked_pts_to_duration), [`Duration::checked_to_std`], [`Timestamp::duration`] | zero — though the first still refuses a negative count for its sign |
+/// | [`checked_recip`](Self::checked_recip) and [`Rate`]'s reciprocal roads | `None` from the `checked_` ones, a panic from the rest: there is no reciprocal |
+/// | the `cmp_semantic`s, [`Timestamp`]'s `==`, the [`TimeRange`] predicates | every count names instant zero, or measures zero |
+/// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
+/// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
+///
 /// # Equality and ordering
 ///
 /// Comparison is **value-based**: `1/2` equals `2/4`, and `1/3 < 2/3 < 1/1`.
@@ -528,6 +555,9 @@ impl Timebase {
   /// - a quotient outside `i64`'s range (pathological for real video);
   /// - a `to` whose numerator is zero — a degenerate timebase names one single
   ///   instant, so no tick count in it can represent a non-zero one.
+  ///
+  /// A degenerate `self` is not one of them: every count of it names instant
+  /// zero, which is tick `0` of any `to`.
   ///
   /// [`Self::saturating_rescale`] is the same arithmetic with the other
   /// posture toward the first of those.
@@ -1167,6 +1197,8 @@ impl Timestamp {
   /// negative PTS, which has no [`StdDuration`] representation).
   ///
   /// Equivalent to `self.duration_since(&Timestamp::new(0, self.timebase()))`.
+  /// Under a degenerate `0/den` timebase every PTS names instant zero, so the
+  /// answer is [`StdDuration::ZERO`] for any count, a negative one included.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<StdDuration> {
     self.duration_since(&Self::new(0, self.timebase))
@@ -3034,6 +3066,11 @@ impl fmt::Display for Rate {
 /// the violations unrepresentable; `i32`/`NonZeroI32` no longer do.)
 /// [`TimeRange`]'s `start <= end` relates two fields, which no per-field hook
 /// can see, so that one needs the whole struct in hand first.
+///
+/// The validators are no *stricter* than the constructors either: a zero
+/// numerator is read because [`Timebase::new`] builds one, so every value
+/// this crate can write reads back. The [type's
+/// docs](Timebase#why-a-zero-numerator-is-legal) say why it is legal.
 #[cfg(feature = "serde")]
 mod de {
   use core::{fmt, num::NonZeroI32};
