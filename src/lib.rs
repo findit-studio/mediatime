@@ -2480,14 +2480,10 @@ impl TimeRange {
   /// The normal `new()` constructor panics in that case. This constructor
   /// skips the assertion so decode can proceed.
   ///
-  /// The *final* value is consistent only when the peer is this crate's own
-  /// encoder, which never writes `start > end`. A foreign or hostile peer
-  /// can write one, and nothing downstream of the last `merge_field` call
-  /// re-checks — so a decoded range can violate the invariant, and
-  /// [`Self::duration`] then panics on it. Closing that needs a policy this
-  /// decoder does not have yet: its other malformed-input arms *clamp* to
-  /// stay total (see `buffa.rs`), and there is no obvious clamp for an
-  /// inverted range.
+  /// The *final* value is judged once the whole message is merged: the
+  /// decoder's `merge_to_limit` and `merge_group` refuse a range whose `end`
+  /// precedes its `start` and restore the value they merged into (see
+  /// `buffa.rs`), so a foreign or hostile peer cannot hand one out.
   #[cfg(feature = "buffa")]
   #[inline(always)]
   pub(crate) const fn new_for_decode(start: i64, end: i64, timebase: Timebase) -> Self {
@@ -2682,10 +2678,12 @@ impl TimeRange {
   ///
   /// # Panics
   ///
-  /// Panics if `end` precedes `start`, which every constructor refuses and
-  /// [`Self::rescale_to`] preserves — so this is unreachable for a range
-  /// built through the public API. It is reachable through the `buffa`
-  /// decoder, which admits an inverted range from the wire.
+  /// Panics if `end` precedes `start`. Every constructor refuses such a
+  /// range, and so do serde and the `buffa` decoder; [`Self::rescale_to`]
+  /// preserves the order. The endpoint setters ([`Self::set_start`],
+  /// [`Self::set_end`] and their `with_` forms) assign without checking, so a
+  /// caller moving both ends can pass through an inverted range, and this
+  /// panics if called on one.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> StdDuration {
     self

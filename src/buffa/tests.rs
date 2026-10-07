@@ -208,3 +208,119 @@ fn timestamp_unknown_field_is_skipped() {
   let ts = <Timestamp as Message>::decode_from_slice(&buf).expect("unknown field skipped");
   assert_eq!(ts, original);
 }
+
+// ---- TimeRange: the endpoint order ----
+
+/// `start` and `end` as a peer might write them, in the order given, with no
+/// timebase field: the decoder seeds `1/1` for it.
+fn endpoints(fields: &[(u32, i64)]) -> Vec<u8> {
+  let mut buf = Vec::new();
+  for &(field, value) in fields {
+    Tag::new(field, WireType::Varint).encode(&mut buf);
+    encode_int64(value, &mut buf);
+  }
+  buf
+}
+
+fn is_inverted_refusal(err: &DecodeError) -> bool {
+  matches!(err, DecodeError::Custom(reason) if *reason == INVERTED_RANGE)
+}
+
+#[test]
+fn an_inverted_range_is_refused_at_decode() {
+  // `end` before `start`, however the fields arrive — including an endpoint
+  // alone that lands past the other's seeded zero.
+  for fields in [
+    &[(1, 100), (2, 50)][..],
+    &[(2, 50), (1, 100)][..],
+    &[(1, 5)][..],
+    &[(2, -1)][..],
+  ] {
+    let err = <TimeRange as Message>::decode_from_slice(&endpoints(fields)).unwrap_err();
+    assert!(is_inverted_refusal(&err), "{fields:?}: {err:?}");
+  }
+}
+
+#[test]
+fn a_range_may_pass_through_an_inverted_state_on_the_way() {
+  // `start` first leaves `[100, 0)` for a moment; only the finished message
+  // is judged.
+  for fields in [&[(1, 100), (2, 200)][..], &[(2, 200), (1, 100)][..]] {
+    let r = <TimeRange as Message>::decode_from_slice(&endpoints(fields)).expect("valid");
+    assert_eq!((r.start_pts(), r.end_pts()), (100, 200), "{fields:?}");
+  }
+  // Equal endpoints are a valid, zero-length range.
+  let r = <TimeRange as Message>::decode_from_slice(&endpoints(&[(1, 7), (2, 7)])).unwrap();
+  assert!(r.is_instant());
+}
+
+#[test]
+fn a_refused_merge_leaves_the_range_as_it_was() {
+  let ms = Timebase::new(1, nz(1000));
+  let before = TimeRange::new(0, 50, ms);
+
+  // Merged into an existing value: `start = 100` alone would leave
+  // `[100, 50)`.
+  let mut r = before;
+  let err = r.merge_from_slice(&endpoints(&[(1, 100)])).unwrap_err();
+  assert!(is_inverted_refusal(&err));
+  assert_eq!(r, before);
+
+  // A merge that fails part-way leaves no inverted residue either.
+  let mut truncated = endpoints(&[(1, 100)]);
+  Tag::new(2, WireType::Varint).encode(&mut truncated);
+  let mut r = before;
+  assert!(matches!(
+    r.merge_from_slice(&truncated),
+    Err(DecodeError::UnexpectedEof | DecodeError::VarintTooLong)
+  ));
+  assert_eq!(r, before);
+
+  // A merge that ends ordered is kept.
+  let mut r = before;
+  r.merge_from_slice(&endpoints(&[(2, 200)])).unwrap();
+  assert_eq!((r.start_pts(), r.end_pts()), (0, 200));
+}
+
+#[test]
+fn every_decode_road_refuses_an_inverted_range() {
+  let inverted = endpoints(&[(1, 100), (2, 50)]);
+  let limit = core::cell::Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+
+  // Length-delimited, as a containing message decodes a field.
+  let mut framed = Vec::new();
+  encode_varint(inverted.len() as u64, &mut framed);
+  framed.extend_from_slice(&inverted);
+  let ctx = DecodeContext::new(buffa::RECURSION_LIMIT, &limit);
+  let mut r = TimeRange::default();
+  let err = r
+    .merge_length_delimited(&mut framed.as_slice(), ctx)
+    .unwrap_err();
+  assert!(is_inverted_refusal(&err), "{err:?}");
+  assert_eq!(r, TimeRange::default());
+  assert!(is_inverted_refusal(
+    &<TimeRange as Message>::decode_length_delimited(&mut framed.as_slice()).unwrap_err()
+  ));
+
+  // Group-encoded, as a delimited-encoding field is.
+  let mut grouped = inverted.clone();
+  Tag::new(7, WireType::EndGroup).encode(&mut grouped);
+  let ctx = DecodeContext::new(buffa::RECURSION_LIMIT, &limit);
+  let mut r = TimeRange::default();
+  let err = r.merge_group(&mut grouped.as_slice(), ctx, 7).unwrap_err();
+  assert!(is_inverted_refusal(&err), "{err:?}");
+  assert_eq!(r, TimeRange::default());
+
+  // And a well-ordered group still decodes, closed by its own field number.
+  let mut ordered = endpoints(&[(1, 1), (2, 2)]);
+  Tag::new(7, WireType::EndGroup).encode(&mut ordered);
+  let ctx = DecodeContext::new(buffa::RECURSION_LIMIT, &limit);
+  let mut r = TimeRange::default();
+  r.merge_group(&mut ordered.as_slice(), ctx, 7).unwrap();
+  assert_eq!((r.start_pts(), r.end_pts()), (1, 2));
+  let ctx = DecodeContext::new(buffa::RECURSION_LIMIT, &limit);
+  assert!(matches!(
+    TimeRange::default().merge_group(&mut ordered.as_slice(), ctx, 8),
+    Err(DecodeError::InvalidEndGroup(7))
+  ));
+}
