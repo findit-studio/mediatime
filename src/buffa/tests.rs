@@ -128,13 +128,15 @@ fn timebase_wire_bytes_are_unchanged_by_the_signed_fields() {
   // Golden bytes captured from the `uint32` encoding this type used before
   // `num`/`den` became signed. `int32` and `uint32` are the same plain
   // varint for non-negative values, so the encoding must not have moved —
-  // and old bytes must still decode to the same value.
+  // and old bytes must still decode to the same value. The one move is
+  // proto3's: a zero numerator is no longer written, and the bytes that
+  // wrote it explicitly still read as the same value.
   for (tb, golden) in [
     (
       Timebase::new(30_000, nz(1001)),
       &b"\x08\xb0\xea\x01\x10\xe9\x07"[..],
     ),
-    (Timebase::new(0, nz(1)), &b"\x08\x00\x10\x01"[..]),
+    (Timebase::new(0, nz(1)), &b"\x10\x01"[..]),
     (
       Timebase::new(1, nz(48_000)),
       &b"\x08\x01\x10\x80\xf7\x02"[..],
@@ -151,6 +153,8 @@ fn timebase_wire_bytes_are_unchanged_by_the_signed_fields() {
       tb
     );
   }
+  let explicit_zero = <Timebase as Message>::decode_from_slice(b"\x08\x00\x10\x01").unwrap();
+  assert_eq!((explicit_zero.num(), explicit_zero.den().get()), (0, 1));
 }
 
 #[test]

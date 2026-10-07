@@ -53,8 +53,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   proto3 encoder's `0/3`, written as the denominator alone, reads back as
   `0/3`, and a range field split over several occurrences merges.
   `TryFrom<wire::X> for X` is the checked conversion, naming what fails in
-  `wire::ConversionError`; `From<X>` is the total one. Each wire type
-  carries buffa's view contracts, so generated code holding a
+  `wire::ConversionError`; `From<X>` is the total one. The types write
+  proto3's canonical form — a scalar only when it is not zero, a nested
+  timebase only when present — byte for byte what buffa's generated code
+  writes for the same messages, so a decode and re-encode merges as the
+  original does. Each wire type carries buffa's view contracts, so
+  generated code holding a
   `.mediatime.v1` field compiles under buffa's default view generation — a
   test compiles buffa-codegen 0.9's output for such a message.
 

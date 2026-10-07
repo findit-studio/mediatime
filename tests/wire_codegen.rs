@@ -36,6 +36,20 @@ mod clip {
   include!("codegen/mediatime05.test.mod.rs");
 }
 
+// buffa's own generated types for `.mediatime.v1`, the reference encoder.
+#[allow(
+  clippy::all,
+  dead_code,
+  missing_docs,
+  rust_2018_idioms,
+  single_use_lifetimes,
+  unreachable_pub,
+  unused_imports
+)]
+mod v1 {
+  include!("codegen/mediatime.v1.mod.rs");
+}
+
 use clip::{Clip, ClipView};
 
 fn field(
@@ -134,24 +148,34 @@ fn clip_proto() -> FileDescriptorProto {
   }
 }
 
-/// `buffa-codegen`'s output for `clip.proto`, with buffa's defaults and the
-/// package mapped onto `::mediatime::wire`.
+/// `buffa-codegen`'s output, with buffa's defaults: `clip.proto` with the
+/// `.mediatime.v1` package mapped onto `::mediatime::wire`, and that package
+/// itself generated as buffa writes any message — the reference encoder the
+/// wire types are held to.
 fn generated() -> Vec<(String, String)> {
-  let mut config = CodeGenConfig::default();
-  config.extern_paths = vec![(".mediatime.v1".into(), "::mediatime::wire".into())];
+  let mut mapped = CodeGenConfig::default();
+  mapped.extern_paths = vec![(".mediatime.v1".into(), "::mediatime::wire".into())];
+  let plain = CodeGenConfig::default();
   assert!(
-    config.generate_views,
+    mapped.generate_views && plain.generate_views,
     "views are buffa's default, and under test"
   );
-  buffa_codegen::generate(
+  let clip = buffa_codegen::generate(
     &[mediatime_v1(), clip_proto()],
     &["mediatime05/test/clip.proto".into()],
-    &config,
-  )
-  .expect("codegen")
-  .into_iter()
-  .map(|file| (file.name, file.content))
-  .collect()
+    &mapped,
+  );
+  let v1 = buffa_codegen::generate(
+    &[mediatime_v1()],
+    &["mediatime/v1/mediatime.proto".into()],
+    &plain,
+  );
+  clip
+    .expect("codegen, clip.proto")
+    .into_iter()
+    .chain(v1.expect("codegen, mediatime.proto"))
+    .map(|file| (file.name, file.content))
+    .collect()
 }
 
 /// The two texts with their line endings normalized: a checkout that turns
@@ -167,8 +191,8 @@ fn the_checked_in_code_is_what_buffa_codegen_writes() {
   let files = generated();
   assert_eq!(
     files.len(),
-    3,
-    "the owned file, its views, and the module tree"
+    6,
+    "for each file: its owned code, its views, its module tree"
   );
   for (name, content) in files {
     let path = dir.join(&name);
@@ -272,4 +296,166 @@ fn a_split_range_field_merges_in_the_message_and_in_its_view() {
     mediatime::TimeRange::try_from(*view.range),
     Ok(mediatime::TimeRange::new(100, 200, Timebase::MILLIS))
   );
+}
+
+#[test]
+fn the_wire_types_write_the_bytes_buffa_generates() {
+  for (num, den) in [(0, 0), (0, 1), (1, 0), (1, 90_000), (-7, 3), (30_000, 1001)] {
+    let reference = v1::Timebase {
+      num,
+      den,
+      ..Default::default()
+    };
+    let ours = wire::Timebase { num, den }.encode_to_vec();
+    assert_eq!(ours, reference.encode_to_vec(), "{num}/{den}");
+  }
+
+  // A timestamp and a range with an absent, an empty, a one-field and a
+  // whole timebase.
+  let reference_timebase = |num, den| v1::Timebase {
+    num,
+    den,
+    ..Default::default()
+  };
+  let timebases = [
+    (None, MessageField::none()),
+    (
+      Some(wire::Timebase { num: 0, den: 0 }),
+      MessageField::some(v1::Timebase::default()),
+    ),
+    (
+      Some(wire::Timebase { num: 0, den: 3 }),
+      MessageField::some(reference_timebase(0, 3)),
+    ),
+    (
+      Some(wire::Timebase {
+        num: 1,
+        den: 90_000,
+      }),
+      MessageField::some(reference_timebase(1, 90_000)),
+    ),
+  ];
+  for (ours, theirs) in timebases {
+    for count in [0, 5, -1] {
+      let stamp = wire::Timestamp {
+        pts: count,
+        timebase: ours,
+      };
+      let reference = v1::Timestamp {
+        pts: count,
+        timebase: theirs.clone(),
+        ..Default::default()
+      };
+      assert_eq!(
+        stamp.encode_to_vec(),
+        reference.encode_to_vec(),
+        "{stamp:?}"
+      );
+      let range = wire::TimeRange {
+        start: count,
+        end: 9,
+        timebase: ours,
+      };
+      let reference = v1::TimeRange {
+        start: count,
+        end: 9,
+        timebase: theirs.clone(),
+        ..Default::default()
+      };
+      assert_eq!(
+        range.encode_to_vec(),
+        reference.encode_to_vec(),
+        "{range:?}"
+      );
+    }
+  }
+
+  // The domain types write what their wire twins write, a zero numerator
+  // included.
+  let zero = Timebase::new(0, nz(3));
+  assert_eq!(
+    zero.encode_to_vec(),
+    reference_timebase(0, 3).encode_to_vec()
+  );
+  assert_eq!(
+    mediatime::Timestamp::new(5, zero).encode_to_vec(),
+    wire::Timestamp::from(mediatime::Timestamp::new(5, zero)).encode_to_vec()
+  );
+}
+
+/// The decode limits buffa applies by default, for a merge driven by hand.
+fn merged_view<V: for<'a> MessageView<'a> + Copy>(existing: V, bytes: &[u8]) -> V {
+  let limit = core::cell::Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+  let mut view = existing;
+  MessageView::merge_into_view(
+    &mut view,
+    bytes,
+    buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &limit),
+  )
+  .unwrap();
+  view
+}
+
+#[test]
+fn a_decode_and_re_encode_merges_as_the_original_does() {
+  // A nested timebase that is empty, or carries its denominator alone,
+  // merged into a timestamp and a range that already hold `1/90000`.
+  let held = wire::Timebase {
+    num: 1,
+    den: 90_000,
+  };
+  let stamp = wire::Timestamp {
+    pts: 7,
+    timebase: Some(held),
+  };
+  let range = wire::TimeRange {
+    start: 1,
+    end: 2,
+    timebase: Some(held),
+  };
+  let reference_stamp = || v1::Timestamp {
+    pts: 7,
+    timebase: MessageField::some(v1::Timebase {
+      num: 1,
+      den: 90_000,
+      ..Default::default()
+    }),
+    ..Default::default()
+  };
+
+  for original in [&[0x12, 0x00][..], &[0x12, 0x02, 0x10, 0x03][..]] {
+    let again = wire::Timestamp::decode_from_slice(original)
+      .unwrap()
+      .encode_to_vec();
+    let owned = |bytes: &[u8]| {
+      let mut merged = stamp;
+      merged.merge_from_slice(bytes).unwrap();
+      merged
+    };
+    assert_eq!(owned(original), owned(&again), "{original:?}");
+    assert_eq!(merged_view(stamp, original), merged_view(stamp, &again));
+    assert_eq!(owned(original), merged_view(stamp, original));
+
+    // And it is the merge buffa's generated message makes.
+    let mut reference = reference_stamp();
+    reference.merge_from_slice(original).unwrap();
+    let ours = owned(original).timebase.unwrap();
+    assert_eq!(
+      (ours.num, ours.den),
+      (reference.timebase.num, reference.timebase.den)
+    );
+  }
+
+  for original in [&[0x1a, 0x00][..], &[0x1a, 0x02, 0x10, 0x03][..]] {
+    let again = wire::TimeRange::decode_from_slice(original)
+      .unwrap()
+      .encode_to_vec();
+    let owned = |bytes: &[u8]| {
+      let mut merged = range;
+      merged.merge_from_slice(bytes).unwrap();
+      merged
+    };
+    assert_eq!(owned(original), owned(&again), "{original:?}");
+    assert_eq!(merged_view(range, original), merged_view(range, &again));
+  }
 }

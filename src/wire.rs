@@ -53,8 +53,8 @@ use ::buffa::{
 /// denominator; `crate::Timebase::try_from` is the checked conversion, and
 /// a zero numerator passes it (see [why it is
 /// legal](crate::Timebase#why-a-zero-numerator-is-legal)). The encoder writes
-/// both fields always, as the domain encoder does, so a reader that starts
-/// from `1/1` still reads a zero numerator back.
+/// proto3's canonical form, each field only when it is not zero — the bytes
+/// buffa's generated code writes for the same message.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Timebase {
   /// Field 1, `int32 num`.
@@ -227,18 +227,30 @@ impl DefaultInstance for Timebase {
 }
 
 impl Message for Timebase {
-  // Both fields are written always — proto3 allows it — so that a reader
-  // starting from `1/1`, as the domain decoder does, reads a zero numerator
-  // back rather than its own default. Both tags are single-byte.
+  // proto3's canonical form: a scalar is written only when it is not zero,
+  // so a field absent on the wire stays absent through a decode and an
+  // encode — and merging the re-encoding changes what merging the original
+  // changes, no more. Both tags are single-byte.
   fn compute_size(&self, _cache: &mut SizeCache) -> u32 {
-    2 + int32_encoded_len(self.num) as u32 + int32_encoded_len(self.den) as u32
+    let mut size = 0u32;
+    if self.num != 0 {
+      size += 1 + int32_encoded_len(self.num) as u32;
+    }
+    if self.den != 0 {
+      size += 1 + int32_encoded_len(self.den) as u32;
+    }
+    size
   }
 
   fn write_to(&self, _cache: &mut SizeCache, buf: &mut impl EncodeSink) {
-    Tag::new(1, WireType::Varint).encode(buf);
-    encode_int32(self.num, buf);
-    Tag::new(2, WireType::Varint).encode(buf);
-    encode_int32(self.den, buf);
+    if self.num != 0 {
+      Tag::new(1, WireType::Varint).encode(buf);
+      encode_int32(self.num, buf);
+    }
+    if self.den != 0 {
+      Tag::new(2, WireType::Varint).encode(buf);
+      encode_int32(self.den, buf);
+    }
   }
 
   fn merge_field(
