@@ -2338,27 +2338,83 @@ impl ExactSeconds {
   }
 
   /// These seconds in ticks of `timebase`, rounded: `num · tb.den / (den ·
-  /// tb.num)`. The common factors of `num` and `tb.num`, and of `tb.den` and
-  /// `den`, are divided out before the products are formed, so the
-  /// intermediates are as small as the answer allows; `None` if one still
-  /// leaves `i128`, or for a degenerate `timebase`.
+  /// tb.num)`, by long division, so neither product is ever formed and a
+  /// small answer is found however large the denominators behind it are.
+  /// `None` for a degenerate `timebase`, for a value between two ticks under
+  /// [`Rounding::Exact`], and for a count whose magnitude leaves `i128`.
+  ///
+  /// The timebase is reduced first — `n/n` is one second a tick — and the
+  /// value's magnitude `m/den` is taken through it in two exact steps:
+  /// `m · tb.den = q1 · den + r1`, then `q1 = q2 · tb.num + r2`. The count's
+  /// floor is `q2`, and what is left over is
+  /// `(r2 + r1/den) / tb.num`, in `[0, 1)`, which is all any rounding needs
+  /// to know: whether it is zero, and how it stands against one half.
   #[cfg_attr(not(tarpaulin), inline(always))]
   const fn ticks_in(self, timebase: Timebase, rounding: Rounding) -> Option<i128> {
     if timebase.num == 0 {
       return None;
     }
-    let (tb_num, tb_den) = (timebase.num as i128, timebase.den.get() as i128);
-    let g1 = gcd_u128(self.num.unsigned_abs(), tb_num as u128) as i128;
-    let g2 = gcd_u128(tb_den as u128, self.den.get() as u128) as i128;
-    let numerator = match (self.num / g1).checked_mul(tb_den / g2) {
-      Some(numerator) => numerator,
+    let timebase = timebase.reduce();
+    let (per_second, seconds_per) = (timebase.den.get() as u128, timebase.num as u128);
+    let den = self.den.get() as u128;
+    let (q1, r1) = match mul_div_u128(self.num.unsigned_abs(), per_second, den) {
+      Some(qr) => qr,
       None => return None,
     };
-    let denominator = match (self.den.get() / g2).checked_mul(tb_num / g1) {
-      Some(denominator) => denominator,
-      None => return None,
+    let (floor, r2) = (q1 / seconds_per, q1 % seconds_per);
+    let whole = r1 == 0 && r2 == 0;
+    // The leftover against one half: `(r2 + r1/den) / seconds_per` vs `1/2`,
+    // that is `2·r2 + 2·r1/den` vs `seconds_per`, with `2·r1/den` in `[0, 2)`.
+    let twice = 2 * r2;
+    let half = if twice + 2 <= seconds_per {
+      Ordering::Less
+    } else if twice > seconds_per {
+      Ordering::Greater
+    } else if twice == seconds_per {
+      if r1 == 0 {
+        Ordering::Equal
+      } else {
+        Ordering::Greater
+      }
+    } else {
+      // `twice + 1 == seconds_per`: the leftover is half exactly when
+      // `2·r1/den` is one. `r1 < den <= i128::MAX`, so `2·r1` fits.
+      cmp_u128(2 * r1, den)
     };
-    div_rounded(numerator, denominator, rounding)
+    // The magnitude rounded, with "away from zero" as "up" — the sign is put
+    // back below, which turns a floor of the magnitude into a ceiling of a
+    // negative count and the other way round.
+    let negative = self.num < 0;
+    let up = match rounding {
+      Rounding::Exact => {
+        if !whole {
+          return None;
+        }
+        false
+      }
+      Rounding::Nearest => !half.is_lt(),
+      Rounding::Floor => !whole && negative,
+      Rounding::Ceil => !whole && !negative,
+    };
+    let magnitude = if up {
+      match floor.checked_add(1) {
+        Some(magnitude) => magnitude,
+        None => return None,
+      }
+    } else {
+      floor
+    };
+    if negative {
+      if magnitude > i128::MAX as u128 + 1 {
+        None
+      } else {
+        Some((magnitude as i128).wrapping_neg())
+      }
+    } else if magnitude > i128::MAX as u128 {
+      None
+    } else {
+      Some(magnitude as i128)
+    }
   }
 }
 
@@ -3453,6 +3509,46 @@ const fn div_rounded(n: i128, d: i128, rounding: Rounding) -> Option<i128> {
   }
 }
 
+/// `a · b` as `q · c + r` with `0 <= r < c`, without forming `a · b` — or
+/// `None` if `q` leaves `u128`. `b` must be under `2^32` and `c` in
+/// `1..=2^127`.
+///
+/// `a = qa · c + ra` puts `qa · b` in the quotient directly; `ra · b` is
+/// built bit by bit of `b`, doubling and adding `ra`, with the partial
+/// remainder kept under `c`. That bound is what keeps every step in range:
+/// a remainder under `c <= 2^127` doubles, or gains `ra < c`, to under
+/// `2^128`, and the partial quotient never reaches `b`.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn mul_div_u128(a: u128, b: u128, c: u128) -> Option<(u128, u128)> {
+  let (qa, ra) = (a / c, a % c);
+  let base = match qa.checked_mul(b) {
+    Some(base) => base,
+    None => return None,
+  };
+  let mut q: u128 = 0;
+  let mut r: u128 = 0;
+  let mut bit = 32;
+  while bit > 0 {
+    bit -= 1;
+    q *= 2;
+    r *= 2;
+    if r >= c {
+      r -= c;
+      q += 1;
+    }
+    if (b >> bit) & 1 == 1 {
+      r += ra;
+      if r >= c {
+        r -= c;
+        q += 1;
+      }
+    }
+  }
+  match base.checked_add(q) {
+    Some(q) => Some((q, r)),
+    None => None,
+  }
+}
 /// [`div_rounded`] where both operands are non-negative, for the unsigned
 /// counts [`Duration`] carries: the floor is plain division, and "away from
 /// zero" is "up".

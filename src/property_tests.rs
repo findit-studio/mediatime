@@ -849,4 +849,42 @@ quickcheck! {
       Ordering::Greater => a.as_f64() >= b.as_f64(),
     }
   }
+
+  /// A sum reads back whenever its count fits: if the exact seconds lie
+  /// between `i64::MIN` and `i64::MAX` ticks of the target, every rounding
+  /// but `Exact` answers — and its answer brackets the sum as the rounding
+  /// says — however large the sum's denominator has grown.
+  fn an_exact_sum_reads_back_whenever_its_count_fits(a: (i16, u32), b: (i16, u32), c: (i16, u32), d: (i16, u32), to: (u32, u32)) -> TestResult {
+    // Small counts over `1/den` timebases: the sum stays small while its
+    // denominator grows toward the product of four 31-bit denominators —
+    // past where a target's numerator times it fits an `i128`.
+    let term = |(ticks, den): (i16, u32)| {
+      let den = (den % (i32::MAX as u32)) as i32 + 1;
+      ExactSeconds::from_signed_duration(SignedDuration::new(ticks as i64, Timebase::new(1, nz(den))))
+    };
+    let Some(sum) = term(a)
+      .checked_add(term(b))
+      .and_then(|s| s.checked_add(term(c)))
+      .and_then(|s| s.checked_add(term(d)))
+    else {
+      return TestResult::discard();
+    };
+    let to = target_timebase(to);
+    let lowest = ExactSeconds::from_signed_duration(SignedDuration::new(i64::MIN, to));
+    let highest = ExactSeconds::from_signed_duration(SignedDuration::new(i64::MAX, to));
+    if sum < lowest || sum > highest {
+      return TestResult::discard();
+    }
+    let read = |rounding| sum.checked_to_signed_duration(to, rounding);
+    let (Some(f), Some(c), Some(n)) = (read(Rounding::Floor), read(Rounding::Ceil), read(Rounding::Nearest)) else {
+      return TestResult::failed();
+    };
+    let (f_s, c_s) = (ExactSeconds::from_signed_duration(f), ExactSeconds::from_signed_duration(c));
+    TestResult::from_bool(
+      f_s <= sum
+        && sum <= c_s
+        && (c.ticks() as i128) - (f.ticks() as i128) == if f_s == sum { 0 } else { 1 }
+        && (n == f || n == c),
+    )
+  }
 }

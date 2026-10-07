@@ -2856,3 +2856,71 @@ fn a_rate_reads_as_the_double_nearest_it() {
   const NTSC: f64 = Rate::FPS_29_97.as_f64();
   const { assert!(NTSC > 29.97 && NTSC < 29.98) };
 }
+
+#[test]
+fn a_tiny_value_reads_back_through_a_timebase_with_large_halves() {
+  // `2147483647/2147483647` is one second a tick, and `2147483646/2147483647`
+  // just under one. 1e-30 s is a sliver of a tick in either: tick 0 down,
+  // tick 1 up, between ticks exactly — never out of range.
+  let sliver = format!("0.{}1", "0".repeat(29));
+  for timebase in [
+    Timebase::new(i32::MAX, nz(i32::MAX)),
+    Timebase::new(i32::MAX - 1, nz(i32::MAX)),
+  ] {
+    let read = |rounding| Timestamp::parse_seconds(&sliver, timebase, rounding).map(|t| t.pts());
+    assert_eq!(read(Rounding::Floor), Ok(0), "{timebase}");
+    assert_eq!(read(Rounding::Nearest), Ok(0), "{timebase}");
+    assert_eq!(read(Rounding::Ceil), Ok(1), "{timebase}");
+    assert_eq!(
+      read(Rounding::Exact),
+      Err(ParseSecondsError::BetweenTicks),
+      "{timebase}"
+    );
+    let back = format!("-{sliver}");
+    let read = |rounding| Timestamp::parse_seconds(&back, timebase, rounding).map(|t| t.pts());
+    assert_eq!(read(Rounding::Floor), Ok(-1), "{timebase}");
+    assert_eq!(read(Rounding::Ceil), Ok(0), "{timebase}");
+  }
+}
+
+#[test]
+fn an_exact_sum_with_large_denominators_reads_back_whatever_its_size() {
+  // Four ticks of four near-coprime timebases near i32::MAX: about 1.86 ns
+  // over a denominator near 2^123. Counted in ticks of 2147483647 s it is a
+  // sliver of the first tick, and in nanoseconds it is 1.86… — both read back
+  // as named, though the denominator times either timebase leaves i128.
+  let mut sum = ExactSeconds::ZERO;
+  for k in 0..4 {
+    let tick = SignedDuration::new(1, Timebase::new(1, nz(i32::MAX - k)));
+    sum = sum
+      .checked_add(ExactSeconds::from_signed_duration(tick))
+      .unwrap();
+  }
+  assert!(sum.den().get() > (1_i128 << 120));
+
+  let coarse = Timebase::new(i32::MAX, nz(1));
+  let read = |timebase, rounding| {
+    sum
+      .checked_to_signed_duration(timebase, rounding)
+      .map(|d| d.ticks())
+  };
+  assert_eq!(read(coarse, Rounding::Floor), Some(0));
+  assert_eq!(read(coarse, Rounding::Nearest), Some(0));
+  assert_eq!(read(coarse, Rounding::Ceil), Some(1));
+  assert_eq!(read(coarse, Rounding::Exact), None);
+
+  assert_eq!(read(Timebase::NANOS, Rounding::Floor), Some(1));
+  assert_eq!(read(Timebase::NANOS, Rounding::Ceil), Some(2));
+  assert_eq!(read(Timebase::NANOS, Rounding::Nearest), Some(2));
+
+  // And backwards, where floor and ceiling trade places.
+  let back = ExactSeconds::ZERO.checked_sub(sum).unwrap();
+  let read = |rounding| {
+    back
+      .checked_to_signed_duration(coarse, rounding)
+      .map(|d| d.ticks())
+  };
+  assert_eq!(read(Rounding::Floor), Some(-1));
+  assert_eq!(read(Rounding::Ceil), Some(0));
+  assert_eq!(read(Rounding::Nearest), Some(0));
+}
