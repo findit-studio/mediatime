@@ -324,3 +324,25 @@ fn every_decode_road_refuses_an_inverted_range() {
     Err(DecodeError::InvalidEndGroup(7))
   ));
 }
+
+#[test]
+fn a_field_that_overruns_its_message_leaves_the_range_as_it_was() {
+  // A one-byte message holding only the `start` tag: decoding its value
+  // reads the next byte, which belongs to the enclosing buffer, as `5`. The
+  // merge is refused for the overrun, and the range keeps its value.
+  let before = TimeRange::new(0, 10, Timebase::new(1, nz(1000)));
+  let framed = [0x01, 0x08, 0x05];
+  let limit = core::cell::Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+  let ctx = DecodeContext::new(buffa::RECURSION_LIMIT, &limit);
+  let mut r = before;
+  assert!(matches!(
+    r.merge_length_delimited(&mut framed.as_slice(), ctx),
+    Err(DecodeError::UnexpectedEof)
+  ));
+  assert_eq!(r, before);
+
+  // The same bytes at the top level are one whole message, and decode.
+  let mut r = before;
+  r.merge_from_slice(&[0x08, 0x05]).unwrap();
+  assert_eq!((r.start_pts(), r.end_pts()), (5, 10));
+}

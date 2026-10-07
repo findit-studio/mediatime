@@ -186,6 +186,12 @@ impl Message for TimeRange {
   ) -> Result<(), DecodeError> {
     let mut merged = wire::TimeRange::from(*self);
     merged.merge_to_limit(buf, ctx, limit)?;
+    // The loop stops once the buffer is at or past `limit`; past it, the last
+    // field consumed bytes that are not this message's. The caller reports
+    // that as `UnexpectedEof` — and the value must not have moved by then.
+    if buf.remaining() != limit {
+      return Err(DecodeError::UnexpectedEof);
+    }
     *self = judged(merged)?;
     Ok(())
   }
