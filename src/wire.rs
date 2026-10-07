@@ -147,15 +147,23 @@ pub enum ConversionError {
   InvertedRange,
 }
 
-impl fmt::Display for ConversionError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str(match self {
+impl ConversionError {
+  /// What failed, in words — the `Display` text, and the reason a domain
+  /// decoder refuses the value with.
+  pub(crate) const fn reason(self) -> &'static str {
+    match self {
       Self::MissingTimebase => "timebase is missing",
       Self::NegativeNumerator => "timebase numerator is negative",
       Self::ZeroDenominator => "timebase denominator is zero",
       Self::NegativeDenominator => "timebase denominator is negative",
       Self::InvertedRange => "time range end precedes its start",
-    })
+    }
+  }
+}
+
+impl fmt::Display for ConversionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(self.reason())
   }
 }
 

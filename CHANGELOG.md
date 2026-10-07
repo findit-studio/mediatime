@@ -70,6 +70,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   uses too) and leave the range as it was, and `with_bounds`/`set_bounds`
   move both ends at once, panicking on inverted bounds as `TimeRange::new`
   does. `TimeRange::duration` no longer has a panic path.
+- **Breaking:** the `buffa` codecs of `Timebase`, `Timestamp` and
+  `TimeRange` read each message through its `wire` twin, from protobuf's
+  zero state, and convert it with the checked conversion. An absent
+  numerator is 0 — so a proto3 encoder's `0/3`, written as the denominator
+  alone, reads as `0/3` and no longer as `1/3` — and a malformed timebase is
+  refused by name (`DecodeError::Custom`) instead of clamped: a zero, absent
+  or negative denominator, a negative numerator, and a timestamp or range
+  without a timebase. A read replaces the value it lands in rather than
+  merging into it, which a type with no zero state cannot do; `wire` keeps
+  protobuf's merge semantics.
 - `Rate`'s `FromStr` also reads a whole number of events per second:
   `"25"` is `25/1`, through `Rate::try_hz`. A decimal rate stays refused
   (`23.976` is not `24000/1001`), and `Timebase`'s door still takes no bare
@@ -79,14 +89,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The `buffa` decoder refuses a `TimeRange` whose `end` precedes its
   `start`, with `DecodeError::Custom`, instead of admitting one whose
-  `duration()` then panicked. It decodes through `wire::TimeRange` and
-  judges the result once the merge is done — in `merge_to_limit` and
-  `merge_group`, where every decode road ends — so a peer may still send
-  `start` first. A merge that fails, one that overruns its declared length
-  included, leaves the value as it was. buffa gives no signal when an
-  enclosing message is done, so on this mapping each occurrence of a split
-  field is judged on its own; map the package to `::mediatime::wire` to
-  keep protobuf's merge semantics.
+  `duration()` then panicked. The whole message is judged once it is read —
+  in `merge_to_limit` and `merge_group`, where every decode road ends — so a
+  peer may still send `start` first. A read that fails, one that overruns
+  its declared length included, leaves the value as it was. buffa gives no
+  signal when an enclosing message is done, so on this mapping each
+  occurrence of a split field is read on its own; map the package to
+  `::mediatime::wire` to keep protobuf's merge semantics.
 - Documentation: a zero `Timebase` numerator stays legal — `0/1` is
   libavformat's "undeclared" timebase, and every reader accepts what the
   constructors build — and `Timebase`'s docs now say what every road does

@@ -165,9 +165,9 @@ fn a_zero_numerator_elided_by_a_proto3_encoder_reads_back_as_zero() {
     (0, 9, Some(Timebase { num: 0, den: 3 }))
   );
 
-  // The domain mapping starts from `1/1`, and reads the same bytes as `1/3`.
-  let misread = <crate::Timebase as Message>::decode_from_slice(&[0x10, 0x03]).unwrap();
-  assert_eq!((misread.num(), misread.den().get()), (1, 3));
+  // The domain mapping reads through this one, from the same zero state.
+  let domain = <crate::Timebase as Message>::decode_from_slice(&[0x10, 0x03]).unwrap();
+  assert_eq!((domain.num(), domain.den().get()), (0, 3));
 }
 
 #[test]
@@ -426,4 +426,18 @@ fn a_view_keeps_the_callers_decode_limits() {
       timebase: Some(Timebase::default()),
     })
   );
+}
+
+quickcheck::quickcheck! {
+  /// The domain codec reads back every timebase and timestamp it writes —
+  /// a zero numerator included, which the small draw reaches often.
+  fn the_domain_codec_reads_back_every_timebase_and_timestamp(pts: i64, num: u32, den: u32, small: bool) -> bool {
+    let num = if small { num % 3 } else { num % (i32::MAX as u32 + 1) };
+    let timebase = crate::Timebase::new(num as i32, nz((den % i32::MAX as u32 + 1) as i32));
+    let stamp = crate::Timestamp::new(pts, timebase);
+    let read_timebase = <crate::Timebase as Message>::decode_from_slice(&timebase.encode_to_vec());
+    let read_stamp = <crate::Timestamp as Message>::decode_from_slice(&stamp.encode_to_vec());
+    read_timebase.ok().map(Timebase::from) == Some(Timebase::from(timebase))
+      && read_stamp.ok().map(Timestamp::from) == Some(Timestamp::from(stamp))
+  }
 }

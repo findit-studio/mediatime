@@ -1,5 +1,18 @@
 use super::*;
 
+use ::buffa::{
+  encoding::{WireType, encode_varint},
+  types::{encode_int32, encode_int64},
+};
+use core::num::NonZeroI32;
+
+const VARINT: u8 = WireType::Varint as u8;
+const LEN: u8 = WireType::LengthDelimited as u8;
+
+/// The reason an inverted range is refused with, as `DecodeError::Custom`
+/// carries it.
+const INVERTED_RANGE: &str = wire::ConversionError::InvertedRange.reason();
+
 fn nz(n: i32) -> NonZeroI32 {
   NonZeroI32::new(n).unwrap()
 }
@@ -45,31 +58,69 @@ fn timebase_field2_wrong_wire_type_errors() {
   );
 }
 
-#[test]
-fn timebase_den_zero_is_clamped_to_one() {
+/// A timebase message with the given fields, each present.
+fn timebase_fields(fields: &[(u32, i32)]) -> Vec<u8> {
   let mut buf: Vec<u8> = Vec::new();
-  Tag::new(1, WireType::Varint).encode(&mut buf);
-  encode_int32(7, &mut buf);
-  Tag::new(2, WireType::Varint).encode(&mut buf);
-  encode_int32(0, &mut buf); // malformed den == 0 on the wire
-  let tb = <Timebase as Message>::decode_from_slice(&buf).expect("decodes with clamp");
-  assert_eq!(tb.num(), 7);
-  assert_eq!(tb.den().get(), 1);
+  for &(field, value) in fields {
+    Tag::new(field, WireType::Varint).encode(&mut buf);
+    encode_int32(value, &mut buf);
+  }
+  buf
 }
 
 #[test]
-fn timebase_negative_fields_are_clamped() {
+fn an_absent_numerator_reads_as_zero() {
+  // proto3 writes `0/3` as the denominator alone: the read starts from
+  // protobuf's zero state, so the numerator it never saw is 0.
+  let tb = <Timebase as Message>::decode_from_slice(&[0x10, 0x03]).unwrap();
+  assert_eq!((tb.num(), tb.den().get()), (0, 3));
+  let mut existing = Timebase::new(30_000, nz(1001));
+  existing.merge_from_slice(&[0x10, 0x03]).unwrap();
+  assert_eq!(
+    (existing.num(), existing.den().get()),
+    (0, 3),
+    "replaced, not merged"
+  );
+}
+
+#[test]
+fn a_bad_timebase_is_refused_by_name_never_clamped() {
   // A peer writing `uint32` values above `i32::MAX` produces varints that
-  // `decode_int32` truncates into the negative half. Both fields clamp to
-  // their smallest legal value rather than panicking in `Timebase::new`.
-  let mut buf: Vec<u8> = Vec::new();
-  Tag::new(1, WireType::Varint).encode(&mut buf);
-  encode_int32(-7, &mut buf);
-  Tag::new(2, WireType::Varint).encode(&mut buf);
-  encode_int32(-9, &mut buf);
-  let tb = <Timebase as Message>::decode_from_slice(&buf).expect("decodes with clamp");
-  assert_eq!(tb.num(), 0);
-  assert_eq!(tb.den().get(), 1);
+  // `decode_int32` truncates into the negative half; a zero or absent
+  // denominator is no denominator. None of them is repaired.
+  for (fields, reason) in [
+    (&[(1, 7), (2, 0)][..], "timebase denominator is zero"),
+    (&[(1, 7)][..], "timebase denominator is zero"),
+    (&[(1, -7), (2, 9)][..], "timebase numerator is negative"),
+    (&[(1, 7), (2, -9)][..], "timebase denominator is negative"),
+  ] {
+    let err = <Timebase as Message>::decode_from_slice(&timebase_fields(fields)).unwrap_err();
+    assert!(
+      matches!(err, DecodeError::Custom(r) if r == reason),
+      "{fields:?}: {err:?}"
+    );
+  }
+  // A refused read leaves the value it was merged into as it was.
+  let mut existing = Timebase::new(1, nz(90_000));
+  assert!(
+    existing
+      .merge_from_slice(&timebase_fields(&[(2, 0)]))
+      .is_err()
+  );
+  assert_eq!(existing, Timebase::new(1, nz(90_000)));
+}
+
+#[test]
+fn a_timestamp_or_range_without_a_timebase_is_refused() {
+  for err in [
+    <Timestamp as Message>::decode_from_slice(&[0x08, 0x05]).unwrap_err(),
+    <TimeRange as Message>::decode_from_slice(&[0x10, 0x05]).unwrap_err(),
+  ] {
+    assert!(
+      matches!(err, DecodeError::Custom("timebase is missing")),
+      "{err:?}"
+    );
+  }
 }
 
 #[test]
@@ -211,14 +262,18 @@ fn timestamp_unknown_field_is_skipped() {
 
 // ---- TimeRange: the endpoint order ----
 
-/// `start` and `end` as a peer might write them, in the order given, with no
-/// timebase field: the decoder seeds `1/1` for it.
+/// `start` and `end` as a peer might write them, in the order given, then a
+/// `1/1` timebase.
 fn endpoints(fields: &[(u32, i64)]) -> Vec<u8> {
   let mut buf = Vec::new();
   for &(field, value) in fields {
     Tag::new(field, WireType::Varint).encode(&mut buf);
     encode_int64(value, &mut buf);
   }
+  let timebase = timebase_fields(&[(1, 1), (2, 1)]);
+  Tag::new(3, WireType::LengthDelimited).encode(&mut buf);
+  encode_varint(timebase.len() as u64, &mut buf);
+  buf.extend_from_slice(&timebase);
   buf
 }
 
@@ -276,10 +331,11 @@ fn a_refused_merge_leaves_the_range_as_it_was() {
   ));
   assert_eq!(r, before);
 
-  // A merge that ends ordered is kept.
+  // A read that is a whole, ordered range replaces the value: `{end: 200}`
+  // with its timebase is `[0, 200) @ 1/1`, its absent start zero.
   let mut r = before;
   r.merge_from_slice(&endpoints(&[(2, 200)])).unwrap();
-  assert_eq!((r.start_pts(), r.end_pts()), (0, 200));
+  assert_eq!(r, TimeRange::new(0, 200, Timebase::default()));
 }
 
 #[test]
@@ -341,8 +397,8 @@ fn a_field_that_overruns_its_message_leaves_the_range_as_it_was() {
   ));
   assert_eq!(r, before);
 
-  // The same bytes at the top level are one whole message, and decode.
+  // A whole message at the top level decodes, and replaces the value.
   let mut r = before;
-  r.merge_from_slice(&[0x08, 0x05]).unwrap();
-  assert_eq!((r.start_pts(), r.end_pts()), (5, 10));
+  r.merge_from_slice(&endpoints(&[(1, 5), (2, 10)])).unwrap();
+  assert_eq!(r, TimeRange::new(5, 10, Timebase::default()));
 }
