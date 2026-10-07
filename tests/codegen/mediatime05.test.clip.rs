@@ -20,6 +20,11 @@ pub struct Clip {
     >,
     /// Field 4: `cuts`
     pub cuts: ::buffa::alloc::vec::Vec<::mediatime::wire::TimeRange>,
+    /// Field 5: `marks`
+    pub marks: ::buffa::__private::HashMap<
+        ::buffa::alloc::string::String,
+        ::mediatime::wire::Timestamp,
+    >,
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
@@ -30,6 +35,7 @@ impl ::core::fmt::Debug for Clip {
             .field("at", &self.at)
             .field("timebase", &self.timebase)
             .field("cuts", &self.cuts)
+            .field("marks", &self.marks)
             .finish()
     }
 }
@@ -92,6 +98,12 @@ impl ::buffa::Message for Clip {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        size
+            += ::buffa::map_codec::message_field_len::<
+                ::buffa::map_codec::Str,
+                _,
+                _,
+            >(&self.marks, 1u64, __cache);
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -134,6 +146,11 @@ impl ::buffa::Message for Clip {
             );
             v.write_to(__cache, buf);
         }
+        ::buffa::map_codec::write_message_field::<
+            ::buffa::map_codec::Str,
+            _,
+            _,
+        >(&self.marks, 5u32, __cache, buf);
         self.__buffa_unknown_fields.write_to(buf);
     }
     fn merge_field(
@@ -192,6 +209,17 @@ impl ::buffa::Message for Clip {
                 ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
                 self.cuts.push(elem);
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::map_codec::merge_entry::<
+                    ::buffa::map_codec::Str,
+                    ::buffa::map_codec::Msg<_>,
+                    _,
+                >(&mut self.marks, buf, ctx)?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -204,6 +232,7 @@ impl ::buffa::Message for Clip {
         self.at = ::buffa::MessageField::none();
         self.timebase = ::buffa::MessageField::none();
         self.cuts.clear();
+        self.marks.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

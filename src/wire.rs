@@ -29,11 +29,26 @@
 //! assert_eq!((timebase.num, timebase.den), (0, 3));
 //! ```
 //!
-//! Mapping the package onto the crate root instead (`"::mediatime"`) decodes
-//! straight into the domain types, through their own `Message` impls. Those
-//! cannot see protobuf's zero state or the end of an enclosing message: a
-//! `Timebase` starts from `1/1` and repairs a malformed field as it lands, and
-//! a `TimeRange` judges each occurrence on its own.
+//! This is the one mapping: the domain types implement neither
+//! `buffa::Message` nor the view contracts. A domain type has no protobuf
+//! zero state, and buffa builds a mapped value without decoding it on several
+//! roads — an omitted map value, an unset field read, an element or a message
+//! before its merge — where a domain type would have to invent one. Here those
+//! roads hold the zero message, and the conversion refuses it by name:
+//!
+//! ```
+//! use buffa::Message;
+//! use mediatime::wire;
+//!
+//! // An unset timestamp — what an omitted map value or an unset field holds.
+//! let unset = wire::Timestamp::default();
+//! assert_eq!(
+//!   mediatime::Timestamp::try_from(unset),
+//!   Err(wire::ConversionError::MissingTimebase)
+//! );
+//! // And it writes nothing back that was not there.
+//! assert!(unset.encode_to_vec().is_empty());
+//! ```
 
 use core::{fmt, num::NonZeroI32};
 

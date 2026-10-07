@@ -127,7 +127,7 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 ///
 /// | road | with a zero numerator |
 /// |---|---|
-/// | construction, `==`, [`Ord`], [`Hash`], `Display`, `FromStr`, serde, `buffa` | legal: every `0/den` equals every other, sorts below every other timebase, and round-trips |
+/// | construction, `==`, [`Ord`], [`Hash`], `Display`, `FromStr`, serde, `buffa` through `wire` | legal: every `0/den` equals every other, sorts below every other timebase, and round-trips |
 /// | a rescale *into* it — the rescale ladders, every type's `rescale_to`, `checked_rescale_to` and `checked_rescale_with`, and the span and shift arithmetic that recounts an operand into it | the `checked_` rung answers `None` and the saturating rung panics, as a zero divisor does; arithmetic within one identical degenerate timebase recounts nothing and stays exact |
 /// | a rescale *out of* it | tick `0`: every count of it names instant zero |
 /// | [`checked_duration_to_pts`](Self::checked_duration_to_pts), [`Duration::checked_from_std`], and their saturating twins | `None`, and a panic |
@@ -3887,18 +3887,3 @@ mod buffa;
 #[cfg(feature = "buffa")]
 #[cfg_attr(docsrs, doc(cfg(feature = "buffa")))]
 pub mod wire;
-
-/// Ancillary module the buffa code generator looks for when an extern-mapped
-/// type is used as a message field with view generation enabled. The mediatime
-/// types contain only scalars, so each view is the owned type itself.
-#[cfg(feature = "buffa")]
-#[doc(hidden)]
-pub mod __buffa {
-  pub mod view {
-    // `'a` is required by buffa's extern-view convention; unused here
-    // because these mediatime types are `Copy`/owned (nothing borrowed).
-    pub type TimebaseView<'a> = crate::Timebase;
-    pub type TimeRangeView<'a> = crate::TimeRange;
-    pub type TimestampView<'a> = crate::Timestamp;
-  }
-}

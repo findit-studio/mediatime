@@ -16,7 +16,7 @@ use buffa::{Message, MessageField, MessageView};
 use buffa_codegen::{
   CodeGenConfig,
   generated::descriptor::{
-    DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+    DescriptorProto, FieldDescriptorProto, FileDescriptorProto, MessageOptions,
     field_descriptor_proto::{Label, Type},
   },
 };
@@ -113,8 +113,42 @@ fn mediatime_v1() -> FileDescriptorProto {
   }
 }
 
-/// A downstream message holding each `mediatime.v1` type once, and a range
-/// repeated.
+/// The nested entry message a `map<key, value>` field is declared through.
+fn map_entry(
+  name: &str,
+  key: Type,
+  key_type: Option<&str>,
+  value: Option<&str>,
+) -> DescriptorProto {
+  let one = Label::LABEL_OPTIONAL;
+  DescriptorProto {
+    options: MessageField::some(MessageOptions {
+      map_entry: Some(true),
+      ..Default::default()
+    }),
+    ..message(
+      name,
+      vec![
+        field("key", 1, one, key, key_type),
+        field("value", 2, one, Type::TYPE_MESSAGE, value),
+      ],
+    )
+  }
+}
+
+trait WithNested {
+  fn with_nested(self, nested: DescriptorProto) -> Self;
+}
+
+impl WithNested for DescriptorProto {
+  fn with_nested(mut self, nested: DescriptorProto) -> Self {
+    self.nested_type.push(nested);
+    self
+  }
+}
+
+/// A downstream message holding each `mediatime.v1` type once, a range
+/// repeated, and a map of timestamps.
 fn clip_proto() -> FileDescriptorProto {
   let one = Label::LABEL_OPTIONAL;
   let range = Some(".mediatime.v1.TimeRange");
@@ -123,27 +157,42 @@ fn clip_proto() -> FileDescriptorProto {
     package: Some("mediatime05.test".into()),
     syntax: Some("proto3".into()),
     dependency: vec!["mediatime/v1/mediatime.proto".into()],
-    message_type: vec![message(
-      "Clip",
-      vec![
-        field("range", 1, one, Type::TYPE_MESSAGE, range),
-        field(
-          "at",
-          2,
-          one,
-          Type::TYPE_MESSAGE,
-          Some(".mediatime.v1.Timestamp"),
-        ),
-        field(
-          "timebase",
-          3,
-          one,
-          Type::TYPE_MESSAGE,
-          Some(".mediatime.v1.Timebase"),
-        ),
-        field("cuts", 4, Label::LABEL_REPEATED, Type::TYPE_MESSAGE, range),
-      ],
-    )],
+    message_type: vec![
+      message(
+        "Clip",
+        vec![
+          field("range", 1, one, Type::TYPE_MESSAGE, range),
+          field(
+            "at",
+            2,
+            one,
+            Type::TYPE_MESSAGE,
+            Some(".mediatime.v1.Timestamp"),
+          ),
+          field(
+            "timebase",
+            3,
+            one,
+            Type::TYPE_MESSAGE,
+            Some(".mediatime.v1.Timebase"),
+          ),
+          field("cuts", 4, Label::LABEL_REPEATED, Type::TYPE_MESSAGE, range),
+          field(
+            "marks",
+            5,
+            Label::LABEL_REPEATED,
+            Type::TYPE_MESSAGE,
+            Some(".mediatime05.test.Clip.MarksEntry"),
+          ),
+        ],
+      )
+      .with_nested(map_entry(
+        "MarksEntry",
+        Type::TYPE_STRING,
+        None,
+        Some(".mediatime.v1.Timestamp"),
+      )),
+    ],
     ..Default::default()
   }
 }
@@ -369,18 +418,6 @@ fn the_wire_types_write_the_bytes_buffa_generates() {
       );
     }
   }
-
-  // The domain types write what their wire twins write, a zero numerator
-  // included.
-  let zero = Timebase::new(0, nz(3));
-  assert_eq!(
-    zero.encode_to_vec(),
-    reference_timebase(0, 3).encode_to_vec()
-  );
-  assert_eq!(
-    mediatime::Timestamp::new(5, zero).encode_to_vec(),
-    wire::Timestamp::from(mediatime::Timestamp::new(5, zero)).encode_to_vec()
-  );
 }
 
 /// The decode limits buffa applies by default, for a merge driven by hand.
@@ -458,4 +495,67 @@ fn a_decode_and_re_encode_merges_as_the_original_does() {
     assert_eq!(owned(original), owned(&again), "{original:?}");
     assert_eq!(merged_view(range, original), merged_view(range, &again));
   }
+}
+
+#[test]
+fn a_map_value_left_out_is_the_wire_zero_and_refused_by_name() {
+  // Field 5, one entry: key "a", its value omitted. buffa inserts the value
+  // without decoding it — `Default::default()` — and here that is the zero
+  // message, which the conversion refuses rather than a value no peer sent.
+  let omitted = [0x2a, 0x03, 0x0a, 0x01, 0x61];
+  let clip = Clip::decode_from_slice(&omitted).unwrap();
+  let value = clip.marks.get("a").copied().expect("the entry is there");
+  assert_eq!(value, wire::Timestamp::default());
+  assert_eq!(
+    mediatime::Timestamp::try_from(value),
+    Err(wire::ConversionError::MissingTimebase)
+  );
+
+  // Re-encoded, buffa writes every map value — here an empty one, with no
+  // field filled in — and it reads back as the same entry.
+  let again = clip.encode_to_vec();
+  assert_eq!(again, [0x2a, 0x05, 0x0a, 0x01, 0x61, 0x12, 0x00]);
+  assert!(Clip::decode_from_slice(&again).unwrap() == clip);
+
+  // An explicitly empty value is the same value, and keeps its bytes.
+  let explicit = Clip::decode_from_slice(&again).unwrap();
+  assert_eq!(explicit.encode_to_vec(), again);
+  assert_eq!(explicit.marks.get("a"), Some(&wire::Timestamp::default()));
+
+  // The view inserts the same zero.
+  let view = ClipView::decode_view(&omitted).unwrap();
+  let (key, value) = view.marks.iter().next().expect("the entry is there");
+  assert_eq!((*key, *value), ("a", wire::Timestamp::default()));
+}
+
+#[test]
+fn an_unset_field_and_an_empty_element_are_the_wire_zero_and_refused_by_name() {
+  // A singular field never sent reads as the default instance: the zero.
+  let clip = Clip::decode_from_slice(&[]).unwrap();
+  assert_eq!(*clip.at, wire::Timestamp::default());
+  assert_eq!(
+    mediatime::Timestamp::try_from(*clip.at),
+    Err(wire::ConversionError::MissingTimebase)
+  );
+  assert_eq!(*clip.timebase, wire::Timebase::default());
+  assert_eq!(
+    Timebase::try_from(*clip.timebase),
+    Err(wire::ConversionError::ZeroDenominator)
+  );
+  assert!(clip.encode_to_vec().is_empty(), "nothing written back");
+
+  // A repeated range with an empty element: the zero range, kept as sent.
+  let bytes = [0x22, 0x00];
+  let clip = Clip::decode_from_slice(&bytes).unwrap();
+  assert_eq!(clip.cuts, [wire::TimeRange::default()]);
+  assert_eq!(
+    mediatime::TimeRange::try_from(clip.cuts[0]),
+    Err(wire::ConversionError::MissingTimebase)
+  );
+  assert_eq!(clip.encode_to_vec(), bytes);
+  let view = ClipView::decode_view(&bytes).unwrap();
+  assert_eq!(
+    view.cuts.iter().copied().collect::<Vec<_>>(),
+    [wire::TimeRange::default()]
+  );
 }

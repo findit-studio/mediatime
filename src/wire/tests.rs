@@ -7,8 +7,7 @@ fn nz(n: i32) -> NonZeroI32 {
 /// An enclosing message with one singular `TimeRange` field (number 1),
 /// merged the way buffa's generated code merges a singular message field:
 /// every occurrence into the same value, through `merge_length_delimited`.
-/// Generic over the field's Rust type, so the same bytes can be decoded
-/// through either mapping.
+/// Generic over the field's Rust type.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Clip<R> {
   range: R,
@@ -121,28 +120,6 @@ fn an_inverted_final_value_still_refuses() {
 }
 
 #[test]
-fn the_domain_mapping_judges_each_occurrence() {
-  // Decoded straight into the domain type, the same split is refused at its
-  // first occurrence — the documented cost of a mapping that never holds an
-  // inverted range — while a field in one occurrence decodes.
-  let mut split = Vec::new();
-  occurrence(&mut split, &range_body(&[(1, 100)], MS));
-  occurrence(&mut split, &range_body(&[(2, 200)], None));
-  assert!(matches!(
-    Clip::<crate::TimeRange>::decode_from_slice(&split),
-    Err(DecodeError::Custom(_))
-  ));
-
-  let mut whole = Vec::new();
-  occurrence(&mut whole, &range_body(&[(1, 100), (2, 200)], MS));
-  let clip = Clip::<crate::TimeRange>::decode_from_slice(&whole).unwrap();
-  assert_eq!(
-    clip.range,
-    crate::TimeRange::new(100, 200, crate::Timebase::MILLIS)
-  );
-}
-
-#[test]
 fn a_zero_numerator_elided_by_a_proto3_encoder_reads_back_as_zero() {
   // proto3 writes `0/3` as the denominator alone: `[0x10, 0x03]`.
   let timebase = Timebase::decode_from_slice(&[0x10, 0x03]).unwrap();
@@ -164,10 +141,6 @@ fn a_zero_numerator_elided_by_a_proto3_encoder_reads_back_as_zero() {
     (range.start, range.end, range.timebase),
     (0, 9, Some(Timebase { num: 0, den: 3 }))
   );
-
-  // The domain mapping reads through this one, from the same zero state.
-  let domain = <crate::Timebase as Message>::decode_from_slice(&[0x10, 0x03]).unwrap();
-  assert_eq!((domain.num(), domain.den().get()), (0, 3));
 }
 
 #[test]
@@ -244,7 +217,8 @@ fn every_field_round_trips_as_written() {
 }
 
 #[test]
-fn the_two_mappings_share_one_encoding() {
+fn a_domain_value_round_trips_through_the_wire() {
+  // Domain → wire → bytes → wire → domain, as written, for each type.
   let tb = crate::Timebase::new(30_000, nz(1001));
   let zero = crate::Timebase::new(0, nz(1));
   for range in [
@@ -253,31 +227,23 @@ fn the_two_mappings_share_one_encoding() {
     crate::TimeRange::new(-5, 0, tb),
     crate::TimeRange::new(i64::MIN, i64::MAX, zero),
   ] {
-    let domain = range.encode_to_vec();
-    let wire = TimeRange::from(range).encode_to_vec();
-    assert_eq!(domain, wire, "{range:?}");
-    let read = TimeRange::decode_from_slice(&domain).unwrap();
+    let read = TimeRange::decode_from_slice(&TimeRange::from(range).encode_to_vec()).unwrap();
+    assert_eq!(read, TimeRange::from(range), "{range:?}");
     assert_eq!(crate::TimeRange::try_from(read), Ok(range));
-    assert_eq!(
-      <crate::TimeRange as Message>::decode_from_slice(&wire).ok(),
-      Some(range)
-    );
   }
   for stamp in [
     crate::Timestamp::new(0, crate::Timebase::MILLIS),
     crate::Timestamp::new(-90_000, crate::Timebase::MPEG_90K),
     crate::Timestamp::new(i64::MAX, zero),
   ] {
-    let domain = stamp.encode_to_vec();
-    assert_eq!(domain, Timestamp::from(stamp).encode_to_vec());
-    let read = Timestamp::decode_from_slice(&domain).unwrap();
+    let read = Timestamp::decode_from_slice(&Timestamp::from(stamp).encode_to_vec()).unwrap();
+    assert_eq!(read, Timestamp::from(stamp), "{stamp:?}");
     let back = crate::Timestamp::try_from(read).unwrap();
     assert_eq!(Timestamp::from(back), Timestamp::from(stamp), "as written");
   }
   for timebase in [tb, zero, crate::Timebase::new(i32::MAX, nz(i32::MAX))] {
-    let domain = timebase.encode_to_vec();
-    assert_eq!(domain, Timebase::from(timebase).encode_to_vec());
-    let back = crate::Timebase::try_from(Timebase::decode_from_slice(&domain).unwrap()).unwrap();
+    let read = Timebase::decode_from_slice(&Timebase::from(timebase).encode_to_vec()).unwrap();
+    let back = crate::Timebase::try_from(read).unwrap();
     assert_eq!(Timebase::from(back), Timebase::from(timebase), "as written");
   }
 }
@@ -383,7 +349,7 @@ fn an_absent_timebase_is_refused_at_conversion_by_name() {
 
 quickcheck::quickcheck! {
   /// Over every range the domain type can hold, the two conversions are
-  /// inverses, and the domain codec reads back what it writes — so this
+  /// inverses, and the wire codec reads back what it writes — so this
   /// version never writes a range it cannot read.
   fn the_conversions_are_inverses_over_every_range(a: i64, b: i64, num: u32, den: u32) -> bool {
     let timebase = crate::Timebase::new(
@@ -392,9 +358,8 @@ quickcheck::quickcheck! {
     );
     let range = crate::TimeRange::new(a.min(b), a.max(b), timebase);
     let wire = TimeRange::from(range);
-    let decoded = <crate::TimeRange as Message>::decode_from_slice(&range.encode_to_vec());
-    crate::TimeRange::try_from(wire).map(TimeRange::from) == Ok(wire)
-      && decoded.ok().map(TimeRange::from) == Some(wire)
+    let decoded = TimeRange::decode_from_slice(&wire.encode_to_vec());
+    crate::TimeRange::try_from(wire).map(TimeRange::from) == Ok(wire) && decoded.ok() == Some(wire)
   }
 }
 
@@ -429,15 +394,162 @@ fn a_view_keeps_the_callers_decode_limits() {
 }
 
 quickcheck::quickcheck! {
-  /// The domain codec reads back every timebase and timestamp it writes —
-  /// a zero numerator included, which the small draw reaches often.
-  fn the_domain_codec_reads_back_every_timebase_and_timestamp(pts: i64, num: u32, den: u32, small: bool) -> bool {
+  /// Every timebase and timestamp the domain types can hold round-trips
+  /// through the wire — a zero numerator included, which the small draw
+  /// reaches often.
+  fn every_timebase_and_timestamp_round_trips_through_the_wire(pts: i64, num: u32, den: u32, small: bool) -> bool {
     let num = if small { num % 3 } else { num % (i32::MAX as u32 + 1) };
     let timebase = crate::Timebase::new(num as i32, nz((den % i32::MAX as u32 + 1) as i32));
     let stamp = crate::Timestamp::new(pts, timebase);
-    let read_timebase = <crate::Timebase as Message>::decode_from_slice(&timebase.encode_to_vec());
-    let read_stamp = <crate::Timestamp as Message>::decode_from_slice(&stamp.encode_to_vec());
-    read_timebase.ok().map(Timebase::from) == Some(Timebase::from(timebase))
-      && read_stamp.ok().map(Timestamp::from) == Some(Timestamp::from(stamp))
+    let read_timebase = Timebase::decode_from_slice(&Timebase::from(timebase).encode_to_vec());
+    let read_stamp = Timestamp::decode_from_slice(&Timestamp::from(stamp).encode_to_vec());
+    let timebase_back = read_timebase.ok().and_then(|t| crate::Timebase::try_from(t).ok());
+    let stamp_back = read_stamp.ok().and_then(|t| crate::Timestamp::try_from(t).ok());
+    timebase_back.map(Timebase::from) == Some(Timebase::from(timebase))
+      && stamp_back.map(Timestamp::from) == Some(Timestamp::from(stamp))
+  }
+}
+
+// ---- The codec itself: defaults, wire types, unknown fields, old bytes ----
+
+#[test]
+fn the_default_instances_are_the_zero_messages_and_clear_returns_to_them() {
+  assert_eq!(*Timebase::default_instance(), Timebase { num: 0, den: 0 });
+  assert_eq!(*Timestamp::default_instance(), Timestamp::default());
+  assert_eq!(*TimeRange::default_instance(), TimeRange::default());
+  let mut timebase = Timebase { num: 7, den: 9 };
+  Message::clear(&mut timebase);
+  assert_eq!(timebase, Timebase::default());
+  let mut stamp = Timestamp {
+    pts: 3,
+    timebase: Some(timebase),
+  };
+  Message::clear(&mut stamp);
+  assert_eq!(stamp, Timestamp::default());
+  let mut range = TimeRange {
+    start: 1,
+    end: 2,
+    timebase: Some(timebase),
+  };
+  Message::clear(&mut range);
+  assert_eq!(range, TimeRange::default());
+}
+
+#[test]
+fn a_field_of_the_wrong_wire_type_is_refused() {
+  let varint = WireType::Varint as u8;
+  let len = WireType::LengthDelimited as u8;
+  let mismatch = |field: u32, wire_type: WireType| {
+    let mut buf = Vec::new();
+    Tag::new(field, wire_type).encode(&mut buf);
+    encode_varint(0, &mut buf);
+    buf
+  };
+  for (err, field, expected) in [
+    (
+      Timebase::decode_from_slice(&mismatch(1, WireType::LengthDelimited)).unwrap_err(),
+      1,
+      varint,
+    ),
+    (
+      Timebase::decode_from_slice(&mismatch(2, WireType::LengthDelimited)).unwrap_err(),
+      2,
+      varint,
+    ),
+    (
+      Timestamp::decode_from_slice(&mismatch(1, WireType::LengthDelimited)).unwrap_err(),
+      1,
+      varint,
+    ),
+    (
+      Timestamp::decode_from_slice(&mismatch(2, WireType::Varint)).unwrap_err(),
+      2,
+      len,
+    ),
+    (
+      TimeRange::decode_from_slice(&mismatch(1, WireType::LengthDelimited)).unwrap_err(),
+      1,
+      varint,
+    ),
+    (
+      TimeRange::decode_from_slice(&mismatch(2, WireType::LengthDelimited)).unwrap_err(),
+      2,
+      varint,
+    ),
+    (
+      TimeRange::decode_from_slice(&mismatch(3, WireType::Varint)).unwrap_err(),
+      3,
+      len,
+    ),
+  ] {
+    assert!(
+      matches!(err, DecodeError::WireTypeMismatch { field_number, expected: e, .. }
+        if field_number == field && e == expected),
+      "field {field}: {err:?}"
+    );
+  }
+}
+
+#[test]
+fn an_unknown_field_is_skipped() {
+  let unknown = |mut buf: Vec<u8>| {
+    Tag::new(9, WireType::Varint).encode(&mut buf);
+    encode_varint(123, &mut buf);
+    buf
+  };
+  let timebase = Timebase { num: 2, den: 3 };
+  assert_eq!(
+    Timebase::decode_from_slice(&unknown(timebase.encode_to_vec())).ok(),
+    Some(timebase)
+  );
+  let stamp = Timestamp {
+    pts: 5,
+    timebase: Some(timebase),
+  };
+  assert_eq!(
+    Timestamp::decode_from_slice(&unknown(stamp.encode_to_vec())).ok(),
+    Some(stamp)
+  );
+  let range = TimeRange {
+    start: 10,
+    end: 20,
+    timebase: Some(timebase),
+  };
+  assert_eq!(
+    TimeRange::decode_from_slice(&unknown(range.encode_to_vec())).ok(),
+    Some(range)
+  );
+}
+
+#[test]
+fn the_bytes_earlier_versions_wrote_still_read() {
+  // Golden bytes from the `uint32` encoding 0.3 wrote, and the explicit zero
+  // numerator 0.4 wrote: `int32` and `uint32` are one varint for these
+  // values, and an explicit zero reads as the zero it is. Only the zero
+  // numerator's own encoding moved, to proto3's elided form.
+  for (num, den, golden, now) in [
+    (
+      30_000,
+      1001,
+      &b"\x08\xb0\xea\x01\x10\xe9\x07"[..],
+      &b"\x08\xb0\xea\x01\x10\xe9\x07"[..],
+    ),
+    (0, 1, &b"\x08\x00\x10\x01"[..], &b"\x10\x01"[..]),
+    (
+      1,
+      48_000,
+      &b"\x08\x01\x10\x80\xf7\x02"[..],
+      &b"\x08\x01\x10\x80\xf7\x02"[..],
+    ),
+    (
+      i32::MAX,
+      i32::MAX,
+      &b"\x08\xff\xff\xff\xff\x07\x10\xff\xff\xff\xff\x07"[..],
+      &b"\x08\xff\xff\xff\xff\x07\x10\xff\xff\xff\xff\x07"[..],
+    ),
+  ] {
+    let read = Timebase::decode_from_slice(golden).unwrap();
+    assert_eq!(read, Timebase { num, den });
+    assert_eq!(read.encode_to_vec(), now, "{num}/{den}");
   }
 }

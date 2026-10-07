@@ -20,6 +20,12 @@ pub struct ClipView<'a> {
         'a,
         ::mediatime::wire::__buffa::view::TimeRangeView<'a>,
     >,
+    /// Field 5: `marks` (map)
+    pub marks: ::buffa::MapView<
+        'a,
+        &'a str,
+        ::mediatime::wire::__buffa::view::TimestampView<'a>,
+    >,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for ClipView<'a> {
@@ -135,6 +141,53 @@ impl<'a> ::buffa::MessageView<'a> for ClipView<'a> {
                         )?,
                     );
             }
+            5u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let entry_bytes = ::buffa::types::borrow_bytes(&mut cur)?;
+                let mut entry_cur: &'a [u8] = entry_bytes;
+                let mut key = "";
+                let mut val = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&key)
+                        + ::buffa::__private::element_footprint(&val),
+                )?;
+                while !entry_cur.is_empty() {
+                    let entry_tag = ::buffa::encoding::Tag::decode(&mut entry_cur)?;
+                    match entry_tag.field_number() {
+                        1 => {
+                            ::buffa::encoding::check_wire_type(
+                                entry_tag,
+                                ::buffa::encoding::WireType::LengthDelimited,
+                            )?;
+                            key = ::buffa::types::borrow_str(&mut entry_cur)?;
+                        }
+                        2 => {
+                            ::buffa::encoding::check_wire_type(
+                                entry_tag,
+                                ::buffa::encoding::WireType::LengthDelimited,
+                            )?;
+                            let __sub_ctx = ctx.descend()?;
+                            let sub = ::buffa::types::borrow_bytes(&mut entry_cur)?;
+                            <::mediatime::wire::__buffa::view::TimestampView as ::buffa::MessageView>::merge_into_view(
+                                &mut val,
+                                sub,
+                                __sub_ctx,
+                            )?;
+                        }
+                        _ => {
+                            ::buffa::encoding::skip_field_depth(
+                                entry_tag,
+                                &mut entry_cur,
+                                ctx.depth(),
+                            )?;
+                        }
+                    }
+                }
+                view.marks.push(key, val);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -189,6 +242,16 @@ impl<'a> ::buffa::MessageView<'a> for ClipView<'a> {
                 .iter()
                 .map(|v| v.to_owned_from_source(__buffa_src))
                 .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            marks: self
+                .marks
+                .iter()
+                .map(|(k, v)| {
+                    ::core::result::Result::<
+                        _,
+                        ::buffa::DecodeError,
+                    >::Ok((k.to_string(), v.to_owned_from_source(__buffa_src)?))
+                })
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -232,6 +295,18 @@ impl<'a> ::buffa::ViewEncode<'a> for ClipView<'a> {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        #[allow(clippy::for_kv_map)]
+        for (k, v) in &self.marks {
+            let entry_size: u64 = 1u64 + ::buffa::types::string_encoded_len(k) as u64
+                + 1u64
+                + {
+                    let __slot = __cache.reserve();
+                    let inner = v.compute_size(__cache);
+                    __cache.set(__slot, inner);
+                    ::buffa::encoding::varint_len(inner as u64) as u64 + inner as u64
+                };
+            size += 1u64 + ::buffa::encoding::varint_len(entry_size) as u64 + entry_size;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -273,6 +348,32 @@ impl<'a> ::buffa::ViewEncode<'a> for ClipView<'a> {
                 u64::from(__cache.consume_next()),
                 buf,
             );
+            v.write_to(__cache, buf);
+        }
+        for (k, v) in &self.marks {
+            let __v_len = __cache.consume_next();
+            let entry_size: u64 = 1u64 + ::buffa::types::string_encoded_len(k) as u64
+                + 1u64
+                + (::buffa::encoding::varint_len(__v_len as u64) as u64
+                    + __v_len as u64);
+            ::buffa::encoding::Tag::new(
+                    5u32,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )
+                .encode(buf);
+            ::buffa::encoding::encode_varint(entry_size, buf);
+            ::buffa::encoding::Tag::new(
+                    1u32,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )
+                .encode(buf);
+            ::buffa::types::encode_string(k, buf);
+            ::buffa::encoding::Tag::new(
+                    2u32,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )
+                .encode(buf);
+            ::buffa::encoding::encode_varint(__v_len as u64, buf);
             v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
@@ -396,6 +497,17 @@ impl ClipOwnedView {
         ::mediatime::wire::__buffa::view::TimeRangeView<'_>,
     > {
         &self.0.reborrow().cuts
+    }
+    /// Field 5: `marks` (map)
+    #[must_use]
+    pub fn marks(
+        &self,
+    ) -> &::buffa::MapView<
+        '_,
+        &'_ str,
+        ::mediatime::wire::__buffa::view::TimestampView<'_>,
+    > {
+        &self.0.reborrow().marks
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<ClipView<'static>>> for ClipOwnedView {
