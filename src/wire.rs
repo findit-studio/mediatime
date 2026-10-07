@@ -406,10 +406,80 @@ impl Message for TimeRange {
   }
 }
 
+/// buffa's view contracts for a wire type that holds scalars only: it is its
+/// own view, borrowing nothing, so a view decodes, merges, encodes and turns
+/// back into the owned message exactly as the message itself does.
+///
+/// The generated view of an enclosing message decodes a field of one of
+/// these types through `MessageView::decode_view_ctx` and merges a repeated
+/// occurrence through `merge_into_view`, measures and writes it through
+/// `ViewEncode`, and reaches an unset one through `DefaultViewInstance`; all
+/// four forward to the owned `Message` impl. `merge_into_view` merges the
+/// whole sub-message at once, as `Message::merge` does.
+macro_rules! scalar_view {
+  ($ty:ty) => {
+    impl<'a> ::buffa::MessageView<'a> for $ty {
+      type Owned = $ty;
+
+      fn decode_view(buf: &'a [u8]) -> Result<Self, DecodeError> {
+        <$ty as Message>::decode_from_slice(buf)
+      }
+
+      fn merge_into_view(
+        &mut self,
+        buf: &'a [u8],
+        ctx: DecodeContext<'_>,
+      ) -> Result<(), DecodeError> {
+        let mut cur = buf;
+        <$ty as Message>::merge(self, &mut cur, ctx)
+      }
+
+      fn merge_view_field(
+        &mut self,
+        tag: Tag,
+        cur: &'a [u8],
+        _before_tag: &'a [u8],
+        ctx: DecodeContext<'_>,
+      ) -> Result<&'a [u8], DecodeError> {
+        let mut cur = cur;
+        <$ty as Message>::merge_field(self, tag, &mut cur, ctx)?;
+        Ok(cur)
+      }
+
+      fn to_owned_message(&self) -> Result<$ty, DecodeError> {
+        Ok(*self)
+      }
+    }
+
+    impl ::buffa::ViewEncode<'_> for $ty {
+      fn compute_size(&self, cache: &mut SizeCache) -> u32 {
+        <$ty as Message>::compute_size(self, cache)
+      }
+
+      fn write_to(&self, cache: &mut SizeCache, buf: &mut impl EncodeSink) {
+        <$ty as Message>::write_to(self, cache, buf)
+      }
+    }
+
+    impl ::buffa::DefaultViewInstance for $ty {
+      fn default_view_instance<'a>() -> &'a Self
+      where
+        Self: 'a,
+      {
+        <$ty as DefaultInstance>::default_instance()
+      }
+    }
+  };
+}
+
+scalar_view!(Timebase);
+scalar_view!(Timestamp);
+scalar_view!(TimeRange);
+
 /// The ancillary module buffa's code generator looks for under an
 /// `extern_path` target when a mapped type is a message field with view
-/// generation enabled; every type here holds scalars only, so each view is
-/// the owned type itself.
+/// generation enabled. Every type here holds scalars only and carries the
+/// view contracts itself, so each view is the owned type.
 #[doc(hidden)]
 pub mod __buffa {
   pub mod view {
