@@ -2628,3 +2628,129 @@ fn exact_seconds_read_back_exactly_or_not_at_all() {
     Some(Duration::new(31, ntsc))
   );
 }
+
+#[test]
+fn range_predicates_follow_ingraphs_algebra() {
+  let ms = Timebase::MILLIS;
+  let r = TimeRange::new(10, 20, ms);
+  let at = |pts: i64| Timestamp::new(pts, ms);
+  let span = |start: i64, end: i64| TimeRange::new(start, end, ms);
+
+  // contains an instant: start <= t && t < end.
+  assert!(!r.contains_instant(&at(9)));
+  assert!(r.contains_instant(&at(10)), "an instant at start is inside");
+  assert!(r.contains_instant(&at(19)));
+  assert!(!r.contains_instant(&at(20)), "an instant at end is not");
+
+  // overlaps: start < b && end > a — strict, so abutting ranges do not.
+  assert!(!r.overlaps(&span(0, 10)) && !span(0, 10).overlaps(&r));
+  assert!(!r.overlaps(&span(20, 30)) && !span(20, 30).overlaps(&r));
+  assert!(r.overlaps(&span(0, 11)) && r.overlaps(&span(19, 30)));
+  assert!(r.overlaps(&span(12, 15)) && r.overlaps(&span(0, 30)));
+
+  // contains a range: start <= a && end >= b; within is the converse.
+  assert!(r.contains(&r) && r.within(&r), "a range contains itself");
+  assert!(r.contains(&span(12, 15)) && span(12, 15).within(&r));
+  assert!(!r.contains(&span(9, 15)) && !r.contains(&span(15, 21)));
+  assert!(r.within(&span(0, 30)) && !r.within(&span(11, 30)));
+
+  // before: end <= t; after: start >= t.
+  assert!(r.before(&at(20)) && r.before(&at(21)) && !r.before(&at(19)));
+  assert!(r.after(&at(10)) && r.after(&at(9)) && !r.after(&at(11)));
+  assert!(
+    r.after(&at(10)) && r.contains_instant(&at(10)),
+    "after and contains meet at start"
+  );
+}
+
+#[test]
+fn range_predicates_at_their_degenerate_cases() {
+  let ms = Timebase::MILLIS;
+  let r = TimeRange::new(10, 20, ms);
+  let empty = |a: i64| TimeRange::new(a, a, ms);
+  let at = |pts: i64| Timestamp::new(pts, ms);
+
+  // A zero-length range contains no instant, not even its own.
+  for a in [9, 10, 15, 20, 21] {
+    assert!(
+      !empty(a).contains_instant(&at(a)),
+      "[{a}, {a}) holds no instant"
+    );
+  }
+
+  // It overlaps a range only strictly inside it: at either boundary it does
+  // not, and it never overlaps another zero-length range, itself included.
+  assert!(
+    !empty(10).overlaps(&r) && !r.overlaps(&empty(10)),
+    "zero-length at start"
+  );
+  assert!(
+    !empty(20).overlaps(&r) && !r.overlaps(&empty(20)),
+    "zero-length at end"
+  );
+  assert!(
+    empty(15).overlaps(&r) && r.overlaps(&empty(15)),
+    "zero-length inside"
+  );
+  assert!(!empty(15).overlaps(&empty(15)));
+  assert!(!empty(5).overlaps(&r) && !empty(25).overlaps(&r));
+
+  // A range contains a zero-length range anywhere in [start, end], its own
+  // end included — though not the instant there.
+  for a in [10, 15, 20] {
+    assert!(
+      r.contains(&empty(a)) && empty(a).within(&r),
+      "[{a}, {a}) within"
+    );
+  }
+  assert!(!r.contains(&empty(9)) && !r.contains(&empty(21)));
+  assert!(r.contains(&empty(20)) && !r.contains_instant(&at(20)));
+  assert!(
+    empty(15).contains(&empty(15)),
+    "and itself, as every range does"
+  );
+
+  // before and after of a zero-length range meet at its instant.
+  assert!(empty(15).before(&at(15)) && empty(15).after(&at(15)));
+}
+
+#[test]
+fn range_predicates_compare_across_timebases_exactly() {
+  // [0, 1) thirds of a second ends at 333 333 333.3… ns. The nanosecond
+  // before is inside; a reading rounded to whole nanoseconds would put the
+  // end on that same nanosecond and call it outside.
+  let thirds = Timebase::new(1, nz(3));
+  let r = TimeRange::new(0, 1, thirds);
+  assert!(r.contains_instant(&Timestamp::new(333_333_333, Timebase::NANOS)));
+  assert!(!r.contains_instant(&Timestamp::new(333_333_334, Timebase::NANOS)));
+  assert!(r.before(&Timestamp::new(333_333_334, Timebase::NANOS)));
+  assert!(!r.before(&Timestamp::new(333_333_333, Timebase::NANOS)));
+
+  // One second, counted in milliseconds and on the MPEG clock.
+  let second = TimeRange::new(0, 1000, Timebase::MILLIS);
+  let mpeg = Timebase::MPEG_90K;
+  assert!(second.overlaps(&TimeRange::new(89_999, 90_001, mpeg)));
+  assert!(
+    !second.overlaps(&TimeRange::new(90_000, 90_001, mpeg)),
+    "they abut"
+  );
+  assert!(second.contains(&TimeRange::new(0, 90_000, mpeg)));
+  assert!(second.within(&TimeRange::new(0, 90_000, mpeg)));
+  assert!(!second.contains_instant(&Timestamp::new(90_000, mpeg)));
+  assert!(second.contains_instant(&Timestamp::new(89_999, mpeg)));
+}
+
+#[test]
+fn a_range_in_a_degenerate_timebase_is_the_zero_length_range_at_zero() {
+  // Both endpoints of [5, 10) @ 0/1 name instant zero, so the range holds no
+  // instant and sits at zero, whatever its counts say.
+  let zero = Timebase::new(0, nz(1));
+  let r = TimeRange::new(5, 10, zero);
+  let ms = Timebase::MILLIS;
+  assert!(!r.contains_instant(&Timestamp::new(0, ms)));
+  assert!(!r.contains_instant(&Timestamp::new(7, zero)));
+  assert!(r.overlaps(&TimeRange::new(-1, 1, ms)));
+  assert!(!r.overlaps(&TimeRange::new(0, 1, ms)));
+  assert!(r.within(&TimeRange::new(0, 0, ms)) && r.contains(&TimeRange::new(0, 0, ms)));
+  assert!(r.before(&Timestamp::new(0, ms)) && r.after(&Timestamp::new(0, ms)));
+}

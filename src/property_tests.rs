@@ -768,4 +768,48 @@ quickcheck! {
       _ => true,
     }
   }
+
+  /// The range algebra's own laws, over small endpoints in tiny timebases —
+  /// degenerate ones included — so boundaries coincide often: `overlaps` is
+  /// symmetric, `within` is `contains` read from the other side and is
+  /// `after` the operand's start and `before` its end.
+  fn range_predicates_keep_their_algebra(a: (i8, i8, (u32, u32)), b: (i8, i8, (u32, u32))) -> bool {
+    let range = |(x, y, tb): (i8, i8, (u32, u32))| {
+      TimeRange::new(x.min(y) as i64, x.max(y) as i64, coarse_timebase(tb))
+    };
+    let (a, b) = (range(a), range(b));
+    a.overlaps(&b) == b.overlaps(&a)
+      && a.within(&b) == b.contains(&a)
+      && a.within(&b) == (a.after(&b.start()) && a.before(&b.end()))
+      && a.overlaps(&b) == (a.start() < b.end() && a.end() > b.start())
+      && a.contains(&b) == (a.start() <= b.start() && a.end() >= b.end())
+  }
+
+  /// Every instant is in exactly one place relative to a range: before its
+  /// start, inside it, or at or past its end.
+  fn an_instant_is_before_inside_or_past_a_range(a: (i8, i8, (u32, u32)), t: (i8, (u32, u32))) -> bool {
+    let (x, y, tb) = a;
+    let range = TimeRange::new(x.min(y) as i64, x.max(y) as i64, coarse_timebase(tb));
+    let t = Timestamp::new(t.0 as i64, coarse_timebase(t.1));
+    let not_begun = range.start() > t;
+    let inside = range.contains_instant(&t);
+    let over = range.before(&t);
+    [not_begun, inside, over].iter().filter(|&&held| held).count() == 1
+  }
+
+  /// For two ranges that each span time, overlapping is sharing an instant:
+  /// the later start comes before the earlier end. (A zero-length range is
+  /// where the algebra and "a shared instant" part ways — see the docs.)
+  fn nonempty_ranges_overlap_when_they_share_time(a: (i8, i8, (u32, u32)), b: (i8, i8, (u32, u32))) -> TestResult {
+    let range = |(x, y, tb): (i8, i8, (u32, u32))| {
+      TimeRange::new(x.min(y) as i64, x.max(y) as i64, coarse_timebase(tb))
+    };
+    let (a, b) = (range(a), range(b));
+    if a.start() >= a.end() || b.start() >= b.end() {
+      return TestResult::discard();
+    }
+    let later_start = a.start().max(b.start());
+    let earlier_end = a.end().min(b.end());
+    TestResult::from_bool(a.overlaps(&b) == (later_start < earlier_end))
+  }
 }

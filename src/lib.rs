@@ -2348,9 +2348,49 @@ impl Ord for ExactSeconds {
 /// fade-in span. When `start == end`, the range is degenerate (an instant);
 /// see [`Self::instant`].
 ///
-/// Both endpoints share the same [`Timebase`]. To compare ranges across
-/// different timebases, rescale one of them first (e.g., by calling
-/// [`Timestamp::rescale_to`] on each endpoint).
+/// Both endpoints share the same [`Timebase`]. The predicates below compare
+/// against ranges and instants counted in any timebase, exactly, by the
+/// 128-bit cross-multiplication [`Timestamp`]'s order uses: nothing needs
+/// rescaling first, and nothing is rounded.
+///
+/// # Where a range sits
+///
+/// The algebra is ingraph's `MediaTimeRangeFilter`'s, operator for operator,
+/// so an in-memory test and a filtered read agree; `self` is the range, the
+/// argument the operand:
+///
+/// | method | operand | true when |
+/// |---|---|---|
+/// | [`contains_instant`](Self::contains_instant) | an instant `t` | `start <= t && t < end` |
+/// | [`contains`](Self::contains) | a range `[a, b)` | `start <= a && end >= b` |
+/// | [`overlaps`](Self::overlaps) | a range `[a, b)` | `start < b && end > a` |
+/// | [`within`](Self::within) | a range `[a, b)` | `start >= a && end <= b` |
+/// | [`before`](Self::before) | an instant `t` | `end <= t` |
+/// | [`after`](Self::after) | an instant `t` | `start >= t` |
+///
+/// The half-openness shows through in three places, all deliberate. An
+/// instant at `start` is contained and one at `end` is not, so an instant
+/// belongs to exactly one of two abutting ranges. `overlaps` is strict at
+/// both ends, so `[0, 10)` and `[10, 20)` abut without overlapping. `contains`
+/// and `within` admit coinciding ends, so a range contains itself.
+///
+/// A **zero-length range** `[a, a)` follows from the same formulas rather
+/// than from a rule of its own:
+///
+/// - it contains no instant, not even `a`;
+/// - it overlaps a range `[x, y)` only when `x < a < y` — never at either end
+///   of it, and never another zero-length range;
+/// - `[x, y)` contains it whenever `x <= a <= y`, its own end included, and
+///   it is then `within` `[x, y)`.
+///
+/// The predicates read the instants the endpoints name, not the counts:
+/// under a degenerate `0/den` timebase both endpoints name instant zero, so
+/// such a range is the zero-length range at zero whatever its counts.
+///
+/// Two readings a caller may want are **not** this type's to decide: an
+/// open-ended range (one with no end yet) is not representable here, and
+/// whether a window of no length "sits at" an instant it touches is a
+/// product rule. Both belong to the caller, on top of these predicates.
 ///
 /// # Equality and ordering
 ///
@@ -2527,6 +2567,73 @@ impl TimeRange {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_instant(&self) -> bool {
     self.start == self.end
+  }
+
+  /// Whether `t` falls inside the range: `start <= t && t < end`.
+  ///
+  /// An instant at `start` is inside and one at `end` is not — the
+  /// half-openness that puts an instant in exactly one of two abutting
+  /// ranges. A zero-length range contains no instant at all. `t` may be
+  /// counted in any timebase; the comparison is exact. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn contains_instant(&self, t: &Timestamp) -> bool {
+    self.start().cmp_semantic(t).is_le() && t.cmp_semantic(&self.end()).is_lt()
+  }
+
+  /// Whether `other` lies inside this range: `start <= other.start` and
+  /// `end >= other.end`.
+  ///
+  /// Coinciding ends are admitted, so a range contains itself; and since a
+  /// zero-length `other` is compared by its one instant at both ends, this
+  /// range contains one at its own `end`, although it does not contain the
+  /// instant there. See [the algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn contains(&self, other: &Self) -> bool {
+    self.start().cmp_semantic(&other.start()).is_le()
+      && self.end().cmp_semantic(&other.end()).is_ge()
+  }
+
+  /// Whether the two ranges overlap: `start < other.end && end > other.start`.
+  ///
+  /// Strict at both ends, so abutting ranges do not overlap, and symmetric.
+  /// A zero-length range overlaps `other` only when it lies strictly inside
+  /// it — not at either end, and never another zero-length range. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn overlaps(&self, other: &Self) -> bool {
+    self.start().cmp_semantic(&other.end()).is_lt()
+      && self.end().cmp_semantic(&other.start()).is_gt()
+  }
+
+  /// Whether this range lies inside `other`: `start >= other.start` and
+  /// `end <= other.end` — [`Self::contains`] read from the other side, so
+  /// `a.within(&b)` is `b.contains(&a)`. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn within(&self, other: &Self) -> bool {
+    other.contains(self)
+  }
+
+  /// Whether the range is over by `t`: `end <= t`.
+  ///
+  /// An `end` at `t` counts, the end being outside the range. With
+  /// [`Self::after`] this is the one-sided half of [`Self::within`]:
+  /// `r.within(&w)` is `r.after(&w.start()) && r.before(&w.end())`. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn before(&self, t: &Timestamp) -> bool {
+    self.end().cmp_semantic(t).is_le()
+  }
+
+  /// Whether the range has not begun before `t`: `start >= t`.
+  ///
+  /// A `start` at `t` counts, so a range can be `after` an instant it also
+  /// contains — the instant at its own start. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn after(&self, t: &Timestamp) -> bool {
+    self.start().cmp_semantic(t).is_ge()
   }
 
   /// Returns the span in PTS units (`end - start`) in this timebase.
