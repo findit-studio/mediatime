@@ -29,9 +29,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the nearest tick. `from_timestamp`/`from_signed_duration`/`from_duration`
   fold in exactly; `checked_add`/`checked_sub` stay exact or answer `None`;
   `checked_to_timestamp`/`checked_to_signed_duration`/`checked_to_duration`
-  read the total back once, by a `Rounding`. `Ord` compares by Euclid's
-  algorithm, so denominators whose cross product leaves `i128` still order
-  exactly.
+  read the total back once, by a `Rounding` — by long division, so every
+  count that fits answers however large the denominators behind it. `Ord`
+  compares by Euclid's algorithm, so denominators whose cross product leaves
+  `i128` still order exactly.
 - `TimeRange::{contains_instant, contains, overlaps, within, before,
   after}` — ingraph's `MediaTimeRangeFilter` algebra in memory, operator for
   operator, compared exactly across timebases. The type's docs carry the
@@ -45,6 +46,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Rounding::Exact`.
 - `Rate::as_f64` — the double nearest a rate, for the places that need a
   float; lossy, and documented as such.
+- `mediatime::wire` (`buffa` feature) — the `mediatime.v1` package as the
+  wire carries it, for `extern_path(".mediatime.v1", "::mediatime::wire")`.
+  `wire::TimeRange` is a range field exactly as merged, with protobuf's
+  merge semantics and no order between its endpoints, so a field split over
+  several occurrences decodes; `TryFrom<wire::TimeRange> for TimeRange`
+  (`wire::InvertedRange`) is the checked conversion, `From<TimeRange>` the
+  total one. `wire::Timebase` and `wire::Timestamp` are the domain types.
 
 ### Changed
 
@@ -57,10 +65,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The `buffa` decoder refuses a `TimeRange` whose `end` precedes its
   `start`, with `DecodeError::Custom`, instead of admitting one whose
-  `duration()` then panicked. The order is judged once the whole message is
-  merged — in `merge_to_limit` and `merge_group`, where every decode road
-  ends — so a peer may still send `start` first; a merge that fails leaves
-  the value as it was.
+  `duration()` then panicked. It decodes through `wire::TimeRange` and
+  judges the result once the merge is done — in `merge_to_limit` and
+  `merge_group`, where every decode road ends — so a peer may still send
+  `start` first. A merge that fails, one that overruns its declared length
+  included, leaves the value as it was. buffa gives no signal when an
+  enclosing message is done, so on this mapping each occurrence of a split
+  field is judged on its own; map the package to `::mediatime::wire` to
+  keep protobuf's merge semantics.
 - Documentation: a zero `Timebase` numerator stays legal — `0/1` is
   libavformat's "undeclared" timebase, and every reader accepts what the
   constructors build — and `Timebase`'s docs now say what every road does
