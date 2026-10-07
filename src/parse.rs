@@ -149,8 +149,9 @@ pub enum ParseSecondsError {
   /// and optionally a point followed by one or more digits — `12`, `-0.5`,
   /// `+3.040`.
   NotDecimal,
-  /// The seconds fall between two ticks of the timebase, and
-  /// [`Rounding::Exact`] was asked for, which refuses to pick one.
+  /// The seconds fall between two ticks of the timebase — both within what
+  /// an `i64` counts — and [`Rounding::Exact`] was asked for, which refuses
+  /// to pick one.
   BetweenTicks,
   /// The seconds are past what an `i64` count of the timebase's ticks
   /// reaches, or have more significant digits than an exact `i128` reading
@@ -433,7 +434,7 @@ impl Timestamp {
   /// - [`ParseSecondsError::DegenerateTimebase`] for a `timebase` whose
   ///   numerator is zero, which can count no instant;
   /// - [`ParseSecondsError::BetweenTicks`] under [`Rounding::Exact`], for
-  ///   seconds between two ticks;
+  ///   seconds between two ticks that an `i64` both counts;
   /// - [`ParseSecondsError::OutOfRange`] for a count past `i64`, or for more
   ///   significant digits than an exact `i128` reading holds.
   pub fn parse_seconds(
@@ -447,10 +448,15 @@ impl Timestamp {
     }
     match seconds.checked_to_timestamp(timebase, rounding) {
       Some(at) => Ok(at),
+      // Between two ticks only if both are ticks an `i64` counts: past the
+      // last one, the instant is out of range whichever way it would round.
       None
         if matches!(rounding, Rounding::Exact)
           && seconds
             .checked_to_timestamp(timebase, Rounding::Floor)
+            .is_some()
+          && seconds
+            .checked_to_timestamp(timebase, Rounding::Ceil)
             .is_some() =>
       {
         Err(ParseSecondsError::BetweenTicks)

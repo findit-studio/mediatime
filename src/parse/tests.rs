@@ -722,3 +722,38 @@ fn parse_seconds_errors_say_what_failed() {
     "the timebase's numerator is zero, so no count of its ticks measures seconds"
   );
 }
+
+#[test]
+fn parse_seconds_names_between_ticks_only_inside_the_range() {
+  let seconds = Timebase::SECONDS;
+  let read = |text, rounding| Timestamp::parse_seconds(text, seconds, rounding).map(|t| t.pts());
+
+  // Half a second past either end of `i64`: the instant is out of range,
+  // though one of its two ticks is not.
+  for text in ["9223372036854775807.5", "-9223372036854775808.5"] {
+    assert_eq!(
+      read(text, Rounding::Exact),
+      Err(ParseSecondsError::OutOfRange),
+      "{text}"
+    );
+  }
+  assert_eq!(read("9223372036854775807.5", Rounding::Floor), Ok(i64::MAX));
+  assert_eq!(
+    read("9223372036854775807.5", Rounding::Ceil),
+    Err(ParseSecondsError::OutOfRange)
+  );
+  assert_eq!(read("-9223372036854775808.5", Rounding::Ceil), Ok(i64::MIN));
+  assert_eq!(
+    read("-9223372036854775808.5", Rounding::Floor),
+    Err(ParseSecondsError::OutOfRange)
+  );
+
+  // Half a second inside either end: between two ticks it counts.
+  for text in ["9223372036854775806.5", "-9223372036854775807.5"] {
+    assert_eq!(
+      read(text, Rounding::Exact),
+      Err(ParseSecondsError::BetweenTicks),
+      "{text}"
+    );
+  }
+}
