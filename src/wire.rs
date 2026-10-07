@@ -1,18 +1,17 @@
 //! The `mediatime.v1` protobuf package as the wire carries it, for buffa's
-//! `extern_path` — the mapping that keeps protobuf's merge semantics.
+//! `extern_path` — the mapping that keeps protobuf's semantics.
 //!
 //! `extern_path(".mediatime.v1", "::mediatime::wire")` maps the package
-//! here. [`Timebase`] and [`Timestamp`] are their own wire faces: every value
-//! a field of either can carry is one the type holds. A range is different.
-//! Its order relates two fields, and protobuf lets a message field arrive in
-//! several occurrences that are merged — `{start: 100}` and then
-//! `{end: 200}` is `[100, 200)` — so the first occurrence alone is an
-//! inverted range, and only the enclosing message knows when the last one has
-//! arrived. buffa has no hook that runs once it has, so the order cannot be
-//! judged while the field decodes. [`TimeRange`] here is the field exactly as
-//! merged, with no order between its endpoints; the domain
-//! [`crate::TimeRange`] is reached by a checked conversion once the enclosing
-//! message is decoded:
+//! here. Each type is its message exactly as protobuf reads it: every field a
+//! plain scalar or message, starting from protobuf's zero state and merged
+//! occurrence by occurrence, with nothing judged, repaired or refused while
+//! it decodes. A proto3 encoder writes `0/3` as the denominator alone, and it
+//! reads back here as `0/3`; a peer's zero denominator stays zero; a range
+//! field split over occurrences — `{start: 100}`, then `{end: 200}` — merges
+//! into `[100, 200)`, though its first part alone is inverted.
+//!
+//! The domain types are reached by checked conversions once the enclosing
+//! message is decoded, and [`ConversionError`] names what a value fails:
 //!
 //! ```
 //! use buffa::Message;
@@ -22,27 +21,58 @@
 //! let bytes = wire::TimeRange::from(range).encode_to_vec();
 //! let decoded = wire::TimeRange::decode_from_slice(&bytes).unwrap();
 //! assert_eq!(mediatime::TimeRange::try_from(decoded), Ok(range));
+//!
+//! // A zero numerator elided by a proto3 encoder reads back as zero.
+//! let timebase = wire::Timebase::decode_from_slice(&[0x10, 0x03]).unwrap();
+//! assert_eq!((timebase.num, timebase.den), (0, 3));
 //! ```
 //!
 //! Mapping the package onto the crate root instead (`"::mediatime"`) decodes
-//! straight into the domain types, through [`crate::TimeRange`]'s own
-//! `Message` impl. That impl cannot see the enclosing message either, so it
-//! judges every merge on its own: it never holds an inverted range, and it
-//! refuses a split field whose first part is one.
+//! straight into the domain types, through their own `Message` impls. Those
+//! cannot see protobuf's zero state or the end of an enclosing message: a
+//! `Timebase` starts from `1/1` and repairs a malformed field as it lands, and
+//! a `TimeRange` judges each occurrence on its own.
 
-use core::fmt;
+use core::{fmt, num::NonZeroI32};
 
 use ::buffa::{
   DecodeContext, DecodeError, DefaultInstance, EncodeSink, Message, SizeCache,
   bytes::Buf,
   encoding::{Tag, WireType, encode_varint, skip_field_depth, varint_len},
-  types::{decode_int64, encode_int64, int64_encoded_len},
+  types::{
+    decode_int32, decode_int64, encode_int32, encode_int64, int32_encoded_len, int64_encoded_len,
+  },
 };
 
-pub use crate::{Timebase, Timestamp};
+/// A `mediatime.v1.Timebase` message as read from the wire: two `int32`
+/// fields, zero when absent, kept as written.
+///
+/// [`crate::Timebase`] holds only a non-negative numerator over a positive
+/// denominator; `crate::Timebase::try_from` is the checked conversion, and
+/// a zero numerator passes it (see [why it is
+/// legal](crate::Timebase#why-a-zero-numerator-is-legal)). The encoder writes
+/// both fields always, as the domain encoder does, so a reader that starts
+/// from `1/1` still reads a zero numerator back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Timebase {
+  /// Field 1, `int32 num`.
+  pub num: i32,
+  /// Field 2, `int32 den`.
+  pub den: i32,
+}
+
+/// A `mediatime.v1.Timestamp` message as read from the wire: a count and a
+/// [`Timebase`] message, zero when absent, kept as written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Timestamp {
+  /// Field 1, `int64 pts`.
+  pub pts: i64,
+  /// Field 2, the `Timebase` message, always encoded.
+  pub timebase: Timebase,
+}
 
 /// A `mediatime.v1.TimeRange` message as merged from the wire: two endpoints
-/// and a timebase, with no order between the endpoints.
+/// and a [`Timebase`] message, with no order between the endpoints.
 ///
 /// It decodes with protobuf's merge semantics unchanged — a field present in
 /// a later occurrence replaces the earlier value, an absent one keeps it —
@@ -60,43 +90,235 @@ pub struct TimeRange {
   pub timebase: Timebase,
 }
 
+impl From<crate::Timebase> for Timebase {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn from(timebase: crate::Timebase) -> Self {
+    Self {
+      num: timebase.num(),
+      den: timebase.den().get(),
+    }
+  }
+}
+
+impl From<crate::Timestamp> for Timestamp {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn from(timestamp: crate::Timestamp) -> Self {
+    Self {
+      pts: timestamp.pts(),
+      timebase: timestamp.timebase().into(),
+    }
+  }
+}
+
 impl From<crate::TimeRange> for TimeRange {
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn from(range: crate::TimeRange) -> Self {
     Self {
       start: range.start_pts(),
       end: range.end_pts(),
-      timebase: range.timebase(),
+      timebase: range.timebase().into(),
     }
   }
 }
 
-/// Returned when a wire range's `end` precedes its `start`, which
-/// [`crate::TimeRange`] cannot hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvertedRange(());
+/// What a wire value fails when it is converted into its domain type.
+///
+/// Marked `#[non_exhaustive]`: a reason added later must not break a `match`
+/// written against these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ConversionError {
+  /// The timebase's numerator is negative.
+  NegativeNumerator,
+  /// The timebase's denominator is zero — or absent, which protobuf reads as
+  /// zero.
+  ZeroDenominator,
+  /// The timebase's denominator is negative.
+  NegativeDenominator,
+  /// The range's `end` precedes its `start`.
+  InvertedRange,
+}
 
-impl fmt::Display for InvertedRange {
+impl fmt::Display for ConversionError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("time range end precedes its start")
+    f.write_str(match self {
+      Self::NegativeNumerator => "timebase numerator is negative",
+      Self::ZeroDenominator => "timebase denominator is zero",
+      Self::NegativeDenominator => "timebase denominator is negative",
+      Self::InvertedRange => "time range end precedes its start",
+    })
   }
 }
 
-impl core::error::Error for InvertedRange {}
+impl core::error::Error for ConversionError {}
 
-/// The checked conversion: the wire range as a [`crate::TimeRange`], or
-/// [`InvertedRange`] if its `end` precedes its `start`.
+/// The checked conversion: the wire timebase as a [`crate::Timebase`], or the
+/// half that fails it. A zero numerator passes.
+impl TryFrom<Timebase> for crate::Timebase {
+  type Error = ConversionError;
+
+  fn try_from(timebase: Timebase) -> Result<Self, ConversionError> {
+    if timebase.num < 0 {
+      return Err(ConversionError::NegativeNumerator);
+    }
+    match NonZeroI32::new(timebase.den) {
+      None => Err(ConversionError::ZeroDenominator),
+      Some(den) if den.get() < 0 => Err(ConversionError::NegativeDenominator),
+      Some(den) => Ok(Self::new(timebase.num, den)),
+    }
+  }
+}
+
+/// The checked conversion: the wire timestamp as a [`crate::Timestamp`], or
+/// what its timebase fails. Every count is a legal PTS.
+impl TryFrom<Timestamp> for crate::Timestamp {
+  type Error = ConversionError;
+
+  fn try_from(timestamp: Timestamp) -> Result<Self, ConversionError> {
+    Ok(Self::new(timestamp.pts, timestamp.timebase.try_into()?))
+  }
+}
+
+/// The checked conversion: the wire range as a [`crate::TimeRange`] — its
+/// timebase judged first, then the order of its endpoints.
 impl TryFrom<TimeRange> for crate::TimeRange {
-  type Error = InvertedRange;
+  type Error = ConversionError;
 
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  fn try_from(range: TimeRange) -> Result<Self, InvertedRange> {
-    Self::try_new(range.start, range.end, range.timebase).ok_or(InvertedRange(()))
+  fn try_from(range: TimeRange) -> Result<Self, ConversionError> {
+    let timebase = range.timebase.try_into()?;
+    Self::try_new(range.start, range.end, timebase).ok_or(ConversionError::InvertedRange)
   }
 }
 
 const VARINT: u8 = WireType::Varint as u8;
 const LEN: u8 = WireType::LengthDelimited as u8;
+
+impl DefaultInstance for Timebase {
+  fn default_instance() -> &'static Self {
+    static VALUE: buffa::__private::OnceBox<Timebase> = buffa::__private::OnceBox::new();
+    VALUE.get_or_init(|| buffa::alloc::boxed::Box::new(Timebase::default()))
+  }
+}
+
+impl Message for Timebase {
+  // Both fields are written always — proto3 allows it — so that a reader
+  // starting from `1/1`, as the domain decoder does, reads a zero numerator
+  // back rather than its own default. Both tags are single-byte.
+  fn compute_size(&self, _cache: &mut SizeCache) -> u32 {
+    2 + int32_encoded_len(self.num) as u32 + int32_encoded_len(self.den) as u32
+  }
+
+  fn write_to(&self, _cache: &mut SizeCache, buf: &mut impl EncodeSink) {
+    Tag::new(1, WireType::Varint).encode(buf);
+    encode_int32(self.num, buf);
+    Tag::new(2, WireType::Varint).encode(buf);
+    encode_int32(self.den, buf);
+  }
+
+  fn merge_field(
+    &mut self,
+    tag: Tag,
+    buf: &mut impl Buf,
+    ctx: DecodeContext<'_>,
+  ) -> Result<(), DecodeError> {
+    match tag.field_number() {
+      1 => {
+        if tag.wire_type() != WireType::Varint {
+          return Err(DecodeError::WireTypeMismatch {
+            field_number: 1,
+            expected: VARINT,
+            actual: tag.wire_type() as u8,
+          });
+        }
+        self.num = decode_int32(buf)?;
+      }
+      2 => {
+        if tag.wire_type() != WireType::Varint {
+          return Err(DecodeError::WireTypeMismatch {
+            field_number: 2,
+            expected: VARINT,
+            actual: tag.wire_type() as u8,
+          });
+        }
+        self.den = decode_int32(buf)?;
+      }
+      _ => skip_field_depth(tag, buf, ctx.depth())?,
+    }
+    Ok(())
+  }
+
+  fn clear(&mut self) {
+    *self = Timebase::default();
+  }
+}
+
+impl DefaultInstance for Timestamp {
+  fn default_instance() -> &'static Self {
+    static VALUE: buffa::__private::OnceBox<Timestamp> = buffa::__private::OnceBox::new();
+    VALUE.get_or_init(|| buffa::alloc::boxed::Box::new(Timestamp::default()))
+  }
+}
+
+impl Message for Timestamp {
+  fn compute_size(&self, cache: &mut SizeCache) -> u32 {
+    let mut size = 0u32;
+    // proto3 zero-elision: every reader seeds `pts` at 0.
+    if self.pts != 0 {
+      size += 1 + int64_encoded_len(self.pts) as u32;
+    }
+    let slot = cache.reserve();
+    let inner = self.timebase.compute_size(cache);
+    cache.set(slot, inner);
+    size += 1 + varint_len(inner as u64) as u32 + inner;
+    size
+  }
+
+  fn write_to(&self, cache: &mut SizeCache, buf: &mut impl EncodeSink) {
+    if self.pts != 0 {
+      Tag::new(1, WireType::Varint).encode(buf);
+      encode_int64(self.pts, buf);
+    }
+    Tag::new(2, WireType::LengthDelimited).encode(buf);
+    encode_varint(cache.consume_next() as u64, buf);
+    self.timebase.write_to(cache, buf);
+  }
+
+  fn merge_field(
+    &mut self,
+    tag: Tag,
+    buf: &mut impl Buf,
+    ctx: DecodeContext<'_>,
+  ) -> Result<(), DecodeError> {
+    match tag.field_number() {
+      1 => {
+        if tag.wire_type() != WireType::Varint {
+          return Err(DecodeError::WireTypeMismatch {
+            field_number: 1,
+            expected: VARINT,
+            actual: tag.wire_type() as u8,
+          });
+        }
+        self.pts = decode_int64(buf)?;
+      }
+      2 => {
+        if tag.wire_type() != WireType::LengthDelimited {
+          return Err(DecodeError::WireTypeMismatch {
+            field_number: 2,
+            expected: LEN,
+            actual: tag.wire_type() as u8,
+          });
+        }
+        buffa::Message::merge_length_delimited(&mut self.timebase, buf, ctx)?;
+      }
+      _ => skip_field_depth(tag, buf, ctx.depth())?,
+    }
+    Ok(())
+  }
+
+  fn clear(&mut self) {
+    *self = Timestamp::default();
+  }
+}
 
 impl DefaultInstance for TimeRange {
   fn default_instance() -> &'static Self {
@@ -193,9 +415,9 @@ pub mod __buffa {
   pub mod view {
     // `'a` is required by buffa's extern-view convention; unused here
     // because these types are `Copy`/owned (nothing borrowed).
-    pub type TimebaseView<'a> = crate::Timebase;
+    pub type TimebaseView<'a> = super::super::Timebase;
     pub type TimeRangeView<'a> = super::super::TimeRange;
-    pub type TimestampView<'a> = crate::Timestamp;
+    pub type TimestampView<'a> = super::super::Timestamp;
   }
 }
 

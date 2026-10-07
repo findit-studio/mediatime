@@ -130,8 +130,17 @@ const INVERTED_RANGE: &str = "time range end precedes its start";
 
 /// The wire range `merged` as the domain range, or the refusal an inverted
 /// one gets — the one judgment every decode road below ends in.
+///
+/// The timebase is repaired, not refused, exactly as [`Timebase`]'s own
+/// decoder repairs one field by field: a negative numerator becomes 0, and a
+/// zero or negative denominator 1. Seeded from the range being merged into,
+/// the result is the one that decoder reaches.
 fn judged(merged: wire::TimeRange) -> Result<TimeRange, DecodeError> {
-  TimeRange::try_from(merged).map_err(|_| DecodeError::Custom(INVERTED_RANGE))
+  let den = NonZeroI32::new(merged.timebase.den)
+    .filter(|d| d.get() > 0)
+    .unwrap_or(DEN_ONE);
+  let timebase = Timebase::new(merged.timebase.num.max(0), den);
+  TimeRange::try_new(merged.start, merged.end, timebase).ok_or(DecodeError::Custom(INVERTED_RANGE))
 }
 
 impl DefaultInstance for TimeRange {
