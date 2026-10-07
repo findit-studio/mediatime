@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 mod parse;
 
 pub use parse::{
-  ParseDurationError, ParseRateError, ParseSignedDurationError, ParseTimeRangeError,
-  ParseTimebaseError, ParseTimestampError,
+  ParseDurationError, ParseRateError, ParseSecondsError, ParseSignedDurationError,
+  ParseTimeRangeError, ParseTimebaseError, ParseTimestampError,
 };
 
 /// Nanoseconds in a second — the factor that turns a [`StdDuration`] into ticks

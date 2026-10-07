@@ -812,4 +812,28 @@ quickcheck! {
     let earlier_end = a.end().min(b.end());
     TestResult::from_bool(a.overlaps(&b) == (later_start < earlier_end))
   }
+
+  /// Decimal seconds read at a timebase land where the same instant, counted
+  /// in milliseconds, rescales to — under every rounding, refusals included.
+  /// The digits are read exactly; a float in between would miss ties.
+  fn decimal_seconds_read_as_the_milliseconds_they_spell(ms: i32, to: (u32, u32), which: u8) -> bool {
+    let to = target_timebase(to);
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
+    let magnitude = ms.unsigned_abs();
+    let sign = if ms < 0 { "-" } else { "" };
+    let text = format!("{sign}{}.{:03}", magnitude / 1000, magnitude % 1000);
+    Timestamp::parse_seconds(&text, to, rounding).ok()
+      == Timestamp::new(ms as i64, Timebase::MILLIS).checked_rescale_with(to, rounding)
+  }
+
+  /// A whole number parses as that many events per second, or is refused
+  /// exactly where `Rate::try_hz` refuses it.
+  fn a_whole_number_parses_as_that_many_events_per_second(n: i32) -> bool {
+    n.to_string().parse::<Rate>().ok() == Rate::try_hz(n)
+  }
 }
