@@ -2335,3 +2335,214 @@ fn directed_rescale_and_the_degenerate_timebase() {
     );
   }
 }
+
+#[test]
+fn an_exact_sum_across_timebases_does_not_drift() {
+  // 3600 one-second clips, counted in milliseconds, laid on a 23.976 fps
+  // timeline. A second is 23.976… frames: the exact total is 86313.686…
+  // frames, rounded once. Adding clip by clip in the frame timebase rounds
+  // every clip to 24 frames first and lands 86 frames late.
+  let clip = SignedDuration::new(1000, Timebase::MILLIS);
+  let frames = Timebase::NTSC_FILM;
+
+  let mut exact = ExactSeconds::ZERO;
+  let mut per_term = SignedDuration::new(0, frames);
+  for _ in 0..3600 {
+    exact = exact
+      .checked_add(ExactSeconds::from_signed_duration(clip))
+      .unwrap();
+    per_term = per_term.checked_add(clip).unwrap();
+  }
+  assert_eq!((exact.num(), exact.den().get()), (3600, 1));
+  assert_eq!(
+    exact.checked_to_signed_duration(frames, Rounding::Nearest),
+    Some(SignedDuration::new(86_314, frames))
+  );
+  assert_eq!(
+    exact.checked_to_signed_duration(frames, Rounding::Floor),
+    Some(SignedDuration::new(86_313, frames))
+  );
+  assert_eq!(per_term.ticks(), 86_400);
+}
+
+#[test]
+fn a_sum_of_milliseconds_and_ntsc_frames_is_exact_and_reads_back_as_asked() {
+  let ms = Timebase::MILLIS;
+  let frames = Timebase::NTSC_VIDEO;
+  let a = ExactSeconds::from_signed_duration(SignedDuration::new(1001, ms));
+  let b = ExactSeconds::from_signed_duration(SignedDuration::new(1, frames));
+  let total = a.checked_add(b).unwrap();
+
+  // 1001/1000 + 1001/30000 = 31031/30000, in lowest terms, in either order,
+  // and taking either term back out leaves the other exactly.
+  assert_eq!((total.num(), total.den().get()), (31_031, 30_000));
+  assert_eq!(b.checked_add(a), Some(total));
+  assert_eq!(total.checked_sub(b), Some(a));
+  assert_eq!(total.checked_sub(a), Some(b));
+
+  // 1034.366… ms: floor, ceiling and nearest each as named, at both signs.
+  let negative = ExactSeconds::ZERO.checked_sub(total).unwrap();
+  for (seconds, floor, ceil, nearest) in
+    [(total, 1034, 1035, 1034), (negative, -1035, -1034, -1034)]
+  {
+    assert_eq!(
+      seconds.checked_to_signed_duration(ms, Rounding::Floor),
+      Some(SignedDuration::new(floor, ms))
+    );
+    assert_eq!(
+      seconds.checked_to_signed_duration(ms, Rounding::Ceil),
+      Some(SignedDuration::new(ceil, ms))
+    );
+    assert_eq!(
+      seconds.checked_to_signed_duration(ms, Rounding::Nearest),
+      Some(SignedDuration::new(nearest, ms))
+    );
+  }
+
+  // In NTSC frames the total is whole — 31 frames — so every rounding agrees.
+  for rounding in [Rounding::Nearest, Rounding::Floor, Rounding::Ceil] {
+    assert_eq!(
+      total.checked_to_signed_duration(frames, rounding),
+      Some(SignedDuration::new(31, frames))
+    );
+  }
+
+  // An unsigned read refuses a negative count, but not a negative value that
+  // rounds to zero: -0.4 ms ceils to nothing at all.
+  assert_eq!(negative.checked_to_duration(ms, Rounding::Ceil), None);
+  assert_eq!(
+    total.checked_to_duration(ms, Rounding::Ceil),
+    Some(Duration::new(1035, ms))
+  );
+  let sliver = ExactSeconds::ZERO
+    .checked_sub(ExactSeconds::from_signed_duration(SignedDuration::new(
+      2,
+      Timebase::new(1, nz(5_000)),
+    )))
+    .unwrap();
+  assert_eq!(
+    sliver.checked_to_duration(ms, Rounding::Ceil),
+    Some(Duration::new(0, ms))
+  );
+  assert_eq!(sliver.checked_to_duration(ms, Rounding::Floor), None);
+}
+
+#[test]
+fn an_instant_plus_spans_is_an_instant() {
+  // One second on the MPEG clock, plus one 29.97 fps frame: 93 003 ticks of
+  // 1/90000 exactly, so it reads back the same under every rounding.
+  let mpeg = Timebase::MPEG_90K;
+  let start = ExactSeconds::from_timestamp(Timestamp::new(90_000, mpeg));
+  let frame = ExactSeconds::from_signed_duration(SignedDuration::new(1, Timebase::NTSC_VIDEO));
+  let at = start.checked_add(frame).unwrap();
+  for rounding in [Rounding::Nearest, Rounding::Floor, Rounding::Ceil] {
+    assert_eq!(
+      at.checked_to_timestamp(mpeg, rounding),
+      Some(Timestamp::new(93_003, mpeg))
+    );
+  }
+  assert_eq!(
+    ExactSeconds::from_duration(Duration::new(90_000, mpeg)),
+    ExactSeconds::from_timestamp(Timestamp::new(90_000, mpeg))
+  );
+}
+
+#[test]
+fn exact_seconds_and_the_degenerate_timebase() {
+  // A count in a degenerate timebase measures zero, whatever it is.
+  let zero = Timebase::new(0, nz(3));
+  assert_eq!(
+    ExactSeconds::from_timestamp(Timestamp::new(i64::MIN, zero)),
+    ExactSeconds::ZERO
+  );
+  assert_eq!(
+    ExactSeconds::from_signed_duration(SignedDuration::new(i64::MAX, zero)),
+    ExactSeconds::ZERO
+  );
+  assert_eq!(
+    ExactSeconds::from_duration(Duration::new(u64::MAX, zero)),
+    ExactSeconds::ZERO
+  );
+  assert_eq!(ExactSeconds::default(), ExactSeconds::ZERO);
+  assert_eq!(
+    (ExactSeconds::ZERO.num(), ExactSeconds::ZERO.den().get()),
+    (0, 1)
+  );
+
+  // And a degenerate timebase can count nothing back, zero included.
+  for rounding in [Rounding::Nearest, Rounding::Floor, Rounding::Ceil] {
+    assert_eq!(
+      ExactSeconds::ZERO.checked_to_timestamp(zero, rounding),
+      None
+    );
+    assert_eq!(
+      ExactSeconds::ZERO.checked_to_signed_duration(zero, rounding),
+      None
+    );
+    assert_eq!(ExactSeconds::ZERO.checked_to_duration(zero, rounding), None);
+  }
+}
+
+#[test]
+fn exact_seconds_refuse_what_i128_cannot_hold() {
+  // One tick each of six neighbouring timebases near i32::MAX: their
+  // denominators share almost no factor, so the common denominator grows by
+  // ~2^31 a term and leaves i128 before the sixth. The sum is refused there —
+  // never wrapped — and every partial sum before it is exact.
+  let mut total = Some(ExactSeconds::ZERO);
+  let mut refused_at = None;
+  for k in 0..6 {
+    let tick = SignedDuration::new(1, Timebase::new(1, nz(i32::MAX - k)));
+    total = total.and_then(|t| t.checked_add(ExactSeconds::from_signed_duration(tick)));
+    if total.is_none() && refused_at.is_none() {
+      refused_at = Some(k);
+    }
+  }
+  let refused_at = refused_at.expect("six near-coprime denominators leave i128");
+  assert!(refused_at >= 3, "refused at term {refused_at}");
+
+  // Reading a whole-second total back into a timebase whose count is past
+  // i64 is refused too.
+  let long = ExactSeconds::from_signed_duration(SignedDuration::new(i64::MAX, Timebase::SECONDS));
+  assert_eq!(
+    long.checked_to_signed_duration(Timebase::MILLIS, Rounding::Floor),
+    None
+  );
+  assert_eq!(
+    long.checked_to_duration(Timebase::MILLIS, Rounding::Floor),
+    None,
+    "past u64 too: i64::MAX s is ~2^73 ms"
+  );
+}
+
+#[test]
+fn exact_seconds_order_is_the_order_of_the_numbers() {
+  let third = ExactSeconds::from_signed_duration(SignedDuration::new(1, Timebase::new(1, nz(3))));
+  let ms333 = ExactSeconds::from_signed_duration(SignedDuration::new(333, Timebase::MILLIS));
+  let ms334 = ExactSeconds::from_signed_duration(SignedDuration::new(334, Timebase::MILLIS));
+  assert!(ms333 < third && third < ms334);
+  assert!(ExactSeconds::ZERO.checked_sub(third).unwrap() < ExactSeconds::ZERO);
+
+  // Denominators whose product leaves i128 still compare exactly.
+  let a =
+    ExactSeconds::from_signed_duration(SignedDuration::new(1, Timebase::new(1, nz(i32::MAX))))
+      .checked_add(ExactSeconds::from_signed_duration(SignedDuration::new(
+        1,
+        Timebase::new(1, nz(i32::MAX - 1)),
+      )))
+      .and_then(|x| {
+        x.checked_add(ExactSeconds::from_signed_duration(SignedDuration::new(
+          1,
+          Timebase::new(1, nz(i32::MAX - 2)),
+        )))
+      })
+      .unwrap();
+  let b = a
+    .checked_add(ExactSeconds::from_signed_duration(SignedDuration::new(
+      1,
+      Timebase::new(1, nz(i32::MAX - 3)),
+    )))
+    .unwrap();
+  assert!(a.den().get() > (1_i128 << 90));
+  assert!(a < b && b > a && a.cmp(&b) == Ordering::Less);
+}

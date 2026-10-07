@@ -671,4 +671,58 @@ quickcheck! {
     };
     nearest_is_the_rung && agrees_with_signed
   }
+
+  /// One term read back is the directed rescale of that term: the exact
+  /// seconds of a span, counted in `to` under a rounding, are what
+  /// `checked_rescale_with` answers — so summing first and rounding once
+  /// changes nothing for a sum of one.
+  fn one_term_read_back_is_the_directed_rescale(ticks: i64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
+    let (from, to) = (any_timebase(from), any_timebase(to));
+    let rounding = [Rounding::Nearest, Rounding::Floor, Rounding::Ceil][which as usize % 3];
+    let span = SignedDuration::new(ticks, from);
+    ExactSeconds::from_signed_duration(span).checked_to_signed_duration(to, rounding)
+      == span.checked_rescale_with(to, rounding)
+  }
+
+  /// The exact sum commutes, and taking a term back out returns the other —
+  /// for spans in unrelated timebases, where no tick of either holds both.
+  fn the_exact_sum_commutes_and_undoes(a: (i64, u32, u32), b: (i64, u32, u32)) -> bool {
+    let a = ExactSeconds::from_signed_duration(SignedDuration::new(a.0, any_timebase((a.1, a.2))));
+    let b = ExactSeconds::from_signed_duration(SignedDuration::new(b.0, any_timebase((b.1, b.2))));
+    match a.checked_add(b) {
+      Some(sum) => b.checked_add(a) == Some(sum) && sum.checked_sub(b) == Some(a) && sum.checked_sub(a) == Some(b),
+      None => b.checked_add(a).is_none(),
+    }
+  }
+
+  /// Exact seconds order as the spans they came from: `Ord` here is
+  /// `cmp_semantic` there. Small counts in unrelated timebases, so the two
+  /// sit close together and astride zero.
+  fn exact_seconds_order_as_their_spans_do(a: (i8, u32, u32), b: (i8, u32, u32)) -> bool {
+    let a = SignedDuration::new(a.0 as i64, any_timebase((a.1, a.2)));
+    let b = SignedDuration::new(b.0 as i64, any_timebase((b.1, b.2)));
+    ExactSeconds::from_signed_duration(a).cmp(&ExactSeconds::from_signed_duration(b)) == a.cmp_semantic(&b)
+  }
+
+  /// A sum's floor and ceiling bracket it: floor ≤ exact ≤ ceiling, one tick
+  /// apart unless the sum lands on a tick — compared as exact seconds, on
+  /// sums whose denominators run past what a cross-multiply holds.
+  fn floor_and_ceil_bracket_an_exact_sum(a: (i64, u32, u32), b: (i64, u32, u32), to: (u32, u32)) -> TestResult {
+    let a = ExactSeconds::from_signed_duration(SignedDuration::new(a.0, any_timebase((a.1, a.2))));
+    let b = ExactSeconds::from_signed_duration(SignedDuration::new(b.0, any_timebase((b.1, b.2))));
+    let to = target_timebase(to);
+    let Some(sum) = a.checked_add(b) else {
+      return TestResult::discard();
+    };
+    let floor = sum.checked_to_signed_duration(to, Rounding::Floor);
+    let ceil = sum.checked_to_signed_duration(to, Rounding::Ceil);
+    let (Some(f), Some(c)) = (floor, ceil) else {
+      return TestResult::discard();
+    };
+    let (f_s, c_s) = (ExactSeconds::from_signed_duration(f), ExactSeconds::from_signed_duration(c));
+    let on_a_tick = f_s == sum;
+    TestResult::from_bool(
+      f_s <= sum && sum <= c_s && (c.ticks() as i128) - (f.ticks() as i128) == if on_a_tick { 0 } else { 1 },
+    )
+  }
 }

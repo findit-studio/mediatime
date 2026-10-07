@@ -17,7 +17,7 @@ use core::{
   cmp::Ordering,
   fmt,
   hash::{Hash, Hasher},
-  num::NonZeroI32,
+  num::{NonZeroI32, NonZeroI128},
   time::Duration as StdDuration,
 };
 
@@ -49,6 +49,19 @@ const fn nz(n: i32) -> NonZeroI32 {
   }
 }
 
+/// `NonZeroI128` from a value its caller has already proved positive — the
+/// denominators [`ExactSeconds`] reduces, which a gcd of at most themselves
+/// divides into at least 1.
+///
+/// # Panics
+///
+/// Panics if `n == 0`, which no call site can pass.
+const fn nz128(n: i128) -> NonZeroI128 {
+  match NonZeroI128::new(n) {
+    Some(v) => v,
+    None => unreachable!(),
+  }
+}
 /// `NonZeroI32` for 1: the default denominator, and the clamp target when a
 /// malformed denominator arrives on the wire.
 ///
@@ -2009,6 +2022,298 @@ impl fmt::Display for Duration {
   }
 }
 
+/// An exact, signed number of seconds: a rational held in lowest terms, with
+/// no timebase of its own — the sum that does not round.
+///
+/// Two spans counted in different timebases cannot be added in either one
+/// without rounding the other into it: [`SignedDuration::checked_add`]
+/// rescales its right operand to the nearest tick of the left's timebase,
+/// and a running total built that way drifts by up to half a tick per term.
+/// Every [`Timestamp`], [`SignedDuration`] and [`Duration`] folds into this
+/// type exactly, whatever its timebase, and the total is read back into a
+/// timebase once, at the end, by the [`Rounding`] the caller names.
+///
+/// ```
+/// use mediatime::{ExactSeconds, Rounding, SignedDuration, Timebase};
+///
+/// // 1001 ms and one 29.97 fps frame (1001/30000 s): 31031/30000 s together.
+/// let ms = ExactSeconds::from_signed_duration(SignedDuration::new(1001, Timebase::MILLIS));
+/// let frame = ExactSeconds::from_signed_duration(SignedDuration::new(1, Timebase::NTSC_VIDEO));
+/// let total = ms.checked_add(frame).unwrap();
+/// assert_eq!((total.num(), total.den().get()), (31_031, 30_000));
+///
+/// // 1034.366… ms, read back the way the caller says.
+/// let floor = total.checked_to_signed_duration(Timebase::MILLIS, Rounding::Floor);
+/// let ceil = total.checked_to_signed_duration(Timebase::MILLIS, Rounding::Ceil);
+/// assert_eq!(floor, Some(SignedDuration::new(1034, Timebase::MILLIS)));
+/// assert_eq!(ceil, Some(SignedDuration::new(1035, Timebase::MILLIS)));
+/// ```
+///
+/// # Instants and spans
+///
+/// The value is a number of seconds and does not say which of the two it is.
+/// [`Self::from_timestamp`] reads an instant as its offset from PTS zero, the
+/// reading [`Timestamp::duration`] takes, so an instant plus spans is an
+/// instant again, and [`Self::checked_to_timestamp`] hands it back as one.
+///
+/// # Range
+///
+/// The numerator and denominator are `i128`. A term folds in as
+/// `ticks · num / den` — a numerator under `2^94` over a denominator under
+/// `2^31` — and a sum's denominator is the least common multiple of its
+/// terms'. The timebases media declares share their prime factors (the whole
+/// [roster](Timebase#the-well-known-roster)'s denominators have an lcm under
+/// `2^39`), so a total over them has room for any `i64` count. Denominators
+/// with no factor in common multiply instead, and an operation whose exact
+/// intermediate would leave `i128` answers `None` rather than a wrong value.
+///
+/// # Equality and ordering
+///
+/// The value is kept in lowest terms with a positive denominator, so it has
+/// one representation per number: equality and [`Hash`] are structural, and
+/// structural is value-based here. [`Ord`] compares the numbers exactly, by
+/// Euclid's algorithm rather than a cross-multiplication that could overflow.
+///
+/// There is no `Display` or `FromStr`: a number of seconds has no one exact
+/// spelling this crate writes — a decimal exists for `1/8` and not for
+/// `1/3` — so [`Self::num`] and [`Self::den`] hand the value out instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExactSeconds {
+  num: i128,
+  den: NonZeroI128,
+}
+
+impl Default for ExactSeconds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::ZERO
+  }
+}
+
+impl ExactSeconds {
+  /// No time at all: `0/1` seconds.
+  pub const ZERO: Self = Self {
+    num: 0,
+    den: nz128(1),
+  };
+
+  /// The instant `ts` names, as its offset from PTS zero: `pts · num / den`
+  /// seconds, exactly.
+  ///
+  /// Total: the product of an `i64` count and an `i32` numerator always fits.
+  /// An instant counted in a degenerate `0/den` timebase is instant zero, and
+  /// folds in as [`Self::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from_timestamp(ts: Timestamp) -> Self {
+    Self::of_count(ts.pts, ts.timebase)
+  }
+
+  /// The span `d` measures, in seconds, exactly — negative when it points
+  /// backwards.
+  ///
+  /// Total, as [`Self::from_timestamp`] is; a span counted in a degenerate
+  /// timebase measures zero and folds in as [`Self::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from_signed_duration(d: SignedDuration) -> Self {
+    Self::of_count(d.ticks, d.timebase)
+  }
+
+  /// The span `d` measures, in seconds, exactly.
+  ///
+  /// Total: a `u64` count times an `i32` numerator is under `2^95`. A span
+  /// counted in a degenerate timebase folds in as [`Self::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from_duration(d: Duration) -> Self {
+    Self::reduced(
+      (d.ticks as i128) * (d.timebase.num as i128),
+      d.timebase.den.get() as i128,
+    )
+  }
+
+  /// The numerator, in lowest terms — negative for a negative number of
+  /// seconds, zero for zero.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn num(&self) -> i128 {
+    self.num
+  }
+
+  /// The denominator, in lowest terms: always positive, and `1` for a whole
+  /// number of seconds.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn den(&self) -> NonZeroI128 {
+    self.den
+  }
+
+  /// The exact sum, or `None` if an intermediate of it leaves `i128`.
+  ///
+  /// Nothing is rounded: the two are brought over a common denominator, the
+  /// least common multiple of theirs, and the sum is reduced again.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_add(self, rhs: Self) -> Option<Self> {
+    self.combine(rhs, false)
+  }
+
+  /// The exact difference, or `None` if an intermediate of it leaves `i128`.
+  ///
+  /// Not an addition of a negated `rhs`, which `i128::MIN` has no room for.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
+    self.combine(rhs, true)
+  }
+
+  /// These seconds as an instant counted in `timebase`, rounded as
+  /// `rounding` says, or `None` if the count is not an `i64` or `timebase` is
+  /// degenerate.
+  ///
+  /// The one rounding a total built here goes through. A degenerate
+  /// `timebase` (`num() == 0`) names one instant and can count no other, so
+  /// it is refused under every rounding, as [`Timebase::checked_rescale`]
+  /// refuses it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_to_timestamp(
+    self,
+    timebase: Timebase,
+    rounding: Rounding,
+  ) -> Option<Timestamp> {
+    match self.ticks_in(timebase, rounding) {
+      Some(ticks) => match i128_to_i64(ticks) {
+        Some(pts) => Some(Timestamp::new(pts, timebase)),
+        None => None,
+      },
+      None => None,
+    }
+  }
+
+  /// These seconds as a span counted in `timebase`, rounded as `rounding`
+  /// says, or `None` if the count is not an `i64` or `timebase` is
+  /// degenerate.
+  ///
+  /// A negative number of seconds is a backward span, and floors and ceils on
+  /// the number line as any count does.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_to_signed_duration(
+    self,
+    timebase: Timebase,
+    rounding: Rounding,
+  ) -> Option<SignedDuration> {
+    match self.ticks_in(timebase, rounding) {
+      Some(ticks) => match i128_to_i64(ticks) {
+        Some(ticks) => Some(SignedDuration::new(ticks, timebase)),
+        None => None,
+      },
+      None => None,
+    }
+  }
+
+  /// These seconds as an unsigned span counted in `timebase`, rounded as
+  /// `rounding` says, or `None` if the rounded count is negative or past
+  /// `u64::MAX`, or `timebase` is degenerate.
+  ///
+  /// The rounded count decides, not the sign of the seconds: `-0.4` ticks
+  /// ceils to a zero-length span, which a [`Duration`] holds.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_to_duration(
+    self,
+    timebase: Timebase,
+    rounding: Rounding,
+  ) -> Option<Duration> {
+    match self.ticks_in(timebase, rounding) {
+      Some(ticks) if ticks >= 0 && ticks <= u64::MAX as i128 => {
+        Some(Duration::new(ticks as u64, timebase))
+      }
+      _ => None,
+    }
+  }
+
+  /// `ticks` of `timebase` in seconds, reduced. Every product fits: an `i64`
+  /// count times an `i32` numerator is under `2^94`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn of_count(ticks: i64, timebase: Timebase) -> Self {
+    Self::reduced(
+      (ticks as i128) * (timebase.num as i128),
+      timebase.den.get() as i128,
+    )
+  }
+
+  /// `num / den` in lowest terms. `den` must be positive, which makes the gcd
+  /// at least 1 and at most `den`, so both divisions are exact and in range —
+  /// `i128::MIN / 1` included.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn reduced(num: i128, den: i128) -> Self {
+    let g = gcd_u128(num.unsigned_abs(), den as u128) as i128;
+    Self {
+      num: num / g,
+      den: nz128(den / g),
+    }
+  }
+
+  /// `self ± rhs` over the least common multiple of the denominators:
+  /// `a/b ± c/d = (a·(d/g) ± c·(b/g)) / ((b/g)·d)` with `g = gcd(b, d)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn combine(self, rhs: Self, subtract: bool) -> Option<Self> {
+    let (b, d) = (self.den.get(), rhs.den.get());
+    let g = gcd_u128(b as u128, d as u128) as i128;
+    let den = match (b / g).checked_mul(d) {
+      Some(den) => den,
+      None => return None,
+    };
+    let left = match self.num.checked_mul(d / g) {
+      Some(left) => left,
+      None => return None,
+    };
+    let right = match rhs.num.checked_mul(b / g) {
+      Some(right) => right,
+      None => return None,
+    };
+    let num = if subtract {
+      left.checked_sub(right)
+    } else {
+      left.checked_add(right)
+    };
+    match num {
+      Some(num) => Some(Self::reduced(num, den)),
+      None => None,
+    }
+  }
+
+  /// These seconds in ticks of `timebase`, rounded: `num · tb.den / (den ·
+  /// tb.num)`. The common factors of `num` and `tb.num`, and of `tb.den` and
+  /// `den`, are divided out before the products are formed, so the
+  /// intermediates are as small as the answer allows; `None` if one still
+  /// leaves `i128`, or for a degenerate `timebase`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn ticks_in(self, timebase: Timebase, rounding: Rounding) -> Option<i128> {
+    if timebase.num == 0 {
+      return None;
+    }
+    let (tb_num, tb_den) = (timebase.num as i128, timebase.den.get() as i128);
+    let g1 = gcd_u128(self.num.unsigned_abs(), tb_num as u128) as i128;
+    let g2 = gcd_u128(tb_den as u128, self.den.get() as u128) as i128;
+    let numerator = match (self.num / g1).checked_mul(tb_den / g2) {
+      Some(numerator) => numerator,
+      None => return None,
+    };
+    let denominator = match (self.den.get() / g2).checked_mul(tb_num / g1) {
+      Some(denominator) => denominator,
+      None => return None,
+    };
+    div_rounded(numerator, denominator, rounding)
+  }
+}
+
+impl PartialOrd for ExactSeconds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for ExactSeconds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn cmp(&self, other: &Self) -> Ordering {
+    cmp_fractions(self.num, self.den.get(), other.num, other.den.get())
+  }
+}
 /// A half-open time range `[start, end)` in a given [`Timebase`].
 ///
 /// Represents the extent of a detected event — for example, a fade-out →
@@ -2857,6 +3162,39 @@ const fn saturating_recount_unsigned(ticks: u64, from: Timebase, to: Timebase) -
   }
 }
 
+/// `a/b` against `c/d` for positive `b` and `d`, exactly and without
+/// overflow, where a cross-multiplication of two `i128` fractions could
+/// leave `i128`.
+///
+/// The floor quotients are compared first; when they tie, the fractional
+/// parts `ra/b` and `rc/d` are compared through their reciprocals in the
+/// opposite order (`ra/b < rc/d` exactly when `d/rc < b/ra`). That is
+/// Euclid's algorithm run on both fractions at once: the denominators shrink
+/// every round, so the loop ends.
+const fn cmp_fractions(mut a: i128, mut b: i128, mut c: i128, mut d: i128) -> Ordering {
+  loop {
+    let (qa, ra) = (a.div_euclid(b), a.rem_euclid(b));
+    let (qc, rc) = (c.div_euclid(d), c.rem_euclid(d));
+    if qa != qc {
+      return cmp_i128(qa, qc);
+    }
+    if ra == 0 {
+      return if rc == 0 {
+        Ordering::Equal
+      } else {
+        Ordering::Less
+      };
+    }
+    if rc == 0 {
+      return Ordering::Greater;
+    }
+    let (next_a, next_b, next_c, next_d) = (d, rc, b, ra);
+    a = next_a;
+    b = next_b;
+    c = next_c;
+    d = next_d;
+  }
+}
 /// `const fn` form of [`Ord::cmp`] on `u128` — the unsigned counterpart of
 /// [`cmp_i128`], for the same reason: the semantic comparisons need it in a
 /// `const` context, where the trait method is unavailable.
