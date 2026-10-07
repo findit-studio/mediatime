@@ -156,13 +156,13 @@ fn a_zero_numerator_elided_by_a_proto3_encoder_reads_back_as_zero() {
     stamp,
     Timestamp {
       pts: 5,
-      timebase: Timebase { num: 0, den: 3 }
+      timebase: Some(Timebase { num: 0, den: 3 })
     }
   );
   let range = TimeRange::decode_from_slice(&[0x10, 0x09, 0x1a, 0x02, 0x10, 0x03]).unwrap();
   assert_eq!(
     (range.start, range.end, range.timebase),
-    (0, 9, Timebase { num: 0, den: 3 })
+    (0, 9, Some(Timebase { num: 0, den: 3 }))
   );
 
   // The domain mapping starts from `1/1`, and reads the same bytes as `1/3`.
@@ -184,20 +184,20 @@ fn a_bad_raw_timebase_refuses_at_conversion_by_name_and_is_never_clamped() {
     assert_eq!(crate::Timebase::try_from(read), Err(refusal), "{num}/{den}");
     let stamp = Timestamp {
       pts: 1,
-      timebase: read,
+      timebase: Some(read),
     };
     assert_eq!(crate::Timestamp::try_from(stamp), Err(refusal));
     let range = TimeRange {
       start: 1,
       end: 2,
-      timebase: read,
+      timebase: Some(read),
     };
     assert_eq!(crate::TimeRange::try_from(range), Err(refusal));
   }
 
-  // An absent timebase is protobuf's zero message, and has no denominator.
-  let range = TimeRange::decode_from_slice(&range_body(&[(2, 9)], None)).unwrap();
-  assert_eq!(range.timebase, Timebase { num: 0, den: 0 });
+  // A timebase message that is present but empty has a zero denominator.
+  let range = TimeRange::decode_from_slice(&[0x10, 0x09, 0x1a, 0x00]).unwrap();
+  assert_eq!(range.timebase, Some(Timebase { num: 0, den: 0 }));
   assert_eq!(
     crate::TimeRange::try_from(range),
     Err(ConversionError::ZeroDenominator)
@@ -225,6 +225,9 @@ fn every_field_round_trips_as_written() {
   for timebase in timebases {
     let read = Timebase::decode_from_slice(&timebase.encode_to_vec()).ok();
     assert_eq!(read, Some(timebase));
+  }
+  let present = timebases.map(Some);
+  for timebase in present.into_iter().chain([None]) {
     for pts in [0, -1, i64::MIN, i64::MAX] {
       let stamp = Timestamp { pts, timebase };
       let read = Timestamp::decode_from_slice(&stamp.encode_to_vec()).ok();
@@ -282,6 +285,7 @@ fn the_two_mappings_share_one_encoding() {
 #[test]
 fn a_conversion_error_says_what_failed() {
   for (error, message) in [
+    (ConversionError::MissingTimebase, "timebase is missing"),
     (
       ConversionError::NegativeNumerator,
       "timebase numerator is negative",
@@ -304,11 +308,75 @@ fn a_conversion_error_says_what_failed() {
   let wire = TimeRange {
     start: 7,
     end: 7,
-    timebase: Timebase { num: 1, den: 1000 },
+    timebase: Some(Timebase { num: 1, den: 1000 }),
   };
   assert_eq!(
     crate::TimeRange::try_from(wire),
     Ok(crate::TimeRange::new(7, 7, crate::Timebase::MILLIS)),
     "equal endpoints are a valid, zero-length range"
+  );
+}
+
+#[test]
+fn a_message_without_a_timebase_re_encodes_without_one() {
+  // Empty in, empty out — byte for byte — for both messages that nest one.
+  let stamp = Timestamp::decode_from_slice(&[]).unwrap();
+  assert_eq!(
+    stamp,
+    Timestamp {
+      pts: 0,
+      timebase: None
+    }
+  );
+  assert!(stamp.encode_to_vec().is_empty());
+  let range = TimeRange::decode_from_slice(&[]).unwrap();
+  assert_eq!(range.timebase, None);
+  assert!(range.encode_to_vec().is_empty());
+
+  // A count alone stays a count alone.
+  let bytes = [0x08, 0x05];
+  let stamp = Timestamp::decode_from_slice(&bytes).unwrap();
+  assert_eq!(stamp.encode_to_vec(), bytes);
+}
+
+#[test]
+fn merging_a_message_without_a_timebase_keeps_the_one_there() {
+  let tb = Timebase {
+    num: 1,
+    den: 90_000,
+  };
+  let empty = Timestamp::decode_from_slice(&[]).unwrap().encode_to_vec();
+  let mut stamp = Timestamp {
+    pts: 5,
+    timebase: Some(tb),
+  };
+  stamp.merge_from_slice(&empty).unwrap();
+  assert_eq!(stamp.timebase, Some(tb));
+
+  let empty = TimeRange::decode_from_slice(&[]).unwrap().encode_to_vec();
+  let mut range = TimeRange {
+    start: 1,
+    end: 2,
+    timebase: Some(tb),
+  };
+  range.merge_from_slice(&empty).unwrap();
+  assert_eq!(range.timebase, Some(tb));
+}
+
+#[test]
+fn an_absent_timebase_is_refused_at_conversion_by_name() {
+  let stamp = Timestamp {
+    pts: 1,
+    timebase: None,
+  };
+  assert_eq!(
+    crate::Timestamp::try_from(stamp),
+    Err(ConversionError::MissingTimebase)
+  );
+  let range = TimeRange::decode_from_slice(&range_body(&[(2, 9)], None)).unwrap();
+  assert_eq!(range.timebase, None);
+  assert_eq!(
+    crate::TimeRange::try_from(range),
+    Err(ConversionError::MissingTimebase)
   );
 }

@@ -135,11 +135,18 @@ const INVERTED_RANGE: &str = "time range end precedes its start";
 /// decoder repairs one field by field: a negative numerator becomes 0, and a
 /// zero or negative denominator 1. Seeded from the range being merged into,
 /// the result is the one that decoder reaches.
-fn judged(merged: wire::TimeRange) -> Result<TimeRange, DecodeError> {
-  let den = NonZeroI32::new(merged.timebase.den)
-    .filter(|d| d.get() > 0)
-    .unwrap_or(DEN_ONE);
-  let timebase = Timebase::new(merged.timebase.num.max(0), den);
+fn judged(merged: wire::TimeRange, seed: Timebase) -> Result<TimeRange, DecodeError> {
+  // Seeded from the range merged into, the timebase is always present; `seed`
+  // stands in only to keep this total.
+  let timebase = match merged.timebase {
+    Some(raw) => {
+      let den = NonZeroI32::new(raw.den)
+        .filter(|d| d.get() > 0)
+        .unwrap_or(DEN_ONE);
+      Timebase::new(raw.num.max(0), den)
+    }
+    None => seed,
+  };
   TimeRange::try_new(merged.start, merged.end, timebase).ok_or(DecodeError::Custom(INVERTED_RANGE))
 }
 
@@ -183,7 +190,7 @@ impl Message for TimeRange {
   ) -> Result<(), DecodeError> {
     let mut merged = wire::TimeRange::from(*self);
     merged.merge_field(tag, buf, ctx)?;
-    *self = judged(merged)?;
+    *self = judged(merged, self.timebase())?;
     Ok(())
   }
 
@@ -201,7 +208,7 @@ impl Message for TimeRange {
     if buf.remaining() != limit {
       return Err(DecodeError::UnexpectedEof);
     }
-    *self = judged(merged)?;
+    *self = judged(merged, self.timebase())?;
     Ok(())
   }
 
@@ -213,7 +220,7 @@ impl Message for TimeRange {
   ) -> Result<(), DecodeError> {
     let mut merged = wire::TimeRange::from(*self);
     merged.merge_group(buf, ctx, field_number)?;
-    *self = judged(merged)?;
+    *self = judged(merged, self.timebase())?;
     Ok(())
   }
 

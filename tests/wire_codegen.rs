@@ -244,12 +244,12 @@ fn a_split_range_field_merges_in_the_message_and_in_its_view() {
   let first = wire::TimeRange {
     start: 100,
     end: 0,
-    timebase: Timebase::MILLIS.into(),
+    timebase: Some(Timebase::MILLIS.into()),
   };
   let second = wire::TimeRange {
     start: 0,
     end: 200,
-    timebase: Timebase::MILLIS.into(),
+    timebase: Some(Timebase::MILLIS.into()),
   };
   let mut bytes = Clip {
     range: MessageField::some(first),

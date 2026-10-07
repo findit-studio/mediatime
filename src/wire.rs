@@ -6,9 +6,11 @@
 //! plain scalar or message, starting from protobuf's zero state and merged
 //! occurrence by occurrence, with nothing judged, repaired or refused while
 //! it decodes. A proto3 encoder writes `0/3` as the denominator alone, and it
-//! reads back here as `0/3`; a peer's zero denominator stays zero; a range
-//! field split over occurrences — `{start: 100}`, then `{end: 200}` — merges
-//! into `[100, 200)`, though its first part alone is inverted.
+//! reads back here as `0/3`; a peer's zero denominator stays zero; a nested
+//! timebase keeps its presence, so a message without one re-encodes without
+//! one; a range field split over occurrences — `{start: 100}`, then
+//! `{end: 200}` — merges into `[100, 200)`, though its first part alone is
+//! inverted.
 //!
 //! The domain types are reached by checked conversions once the enclosing
 //! message is decoded, and [`ConversionError`] names what a value fails:
@@ -61,14 +63,16 @@ pub struct Timebase {
   pub den: i32,
 }
 
-/// A `mediatime.v1.Timestamp` message as read from the wire: a count and a
-/// [`Timebase`] message, zero when absent, kept as written.
+/// A `mediatime.v1.Timestamp` message as read from the wire: a count, zero
+/// when absent, and a [`Timebase`] message with its presence.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Timestamp {
   /// Field 1, `int64 pts`.
   pub pts: i64,
-  /// Field 2, the `Timebase` message, always encoded.
-  pub timebase: Timebase,
+  /// Field 2, the `Timebase` message: `None` when the message carried none,
+  /// and written only when present, so absence survives a decode and an
+  /// encode.
+  pub timebase: Option<Timebase>,
 }
 
 /// A `mediatime.v1.TimeRange` message as merged from the wire: two endpoints
@@ -86,8 +90,9 @@ pub struct TimeRange {
   pub start: i64,
   /// Field 2, `int64 end`.
   pub end: i64,
-  /// Field 3, the `Timebase` message, always encoded.
-  pub timebase: Timebase,
+  /// Field 3, the `Timebase` message: `None` when the message carried none,
+  /// and written only when present.
+  pub timebase: Option<Timebase>,
 }
 
 impl From<crate::Timebase> for Timebase {
@@ -105,7 +110,7 @@ impl From<crate::Timestamp> for Timestamp {
   fn from(timestamp: crate::Timestamp) -> Self {
     Self {
       pts: timestamp.pts(),
-      timebase: timestamp.timebase().into(),
+      timebase: Some(timestamp.timebase().into()),
     }
   }
 }
@@ -116,7 +121,7 @@ impl From<crate::TimeRange> for TimeRange {
     Self {
       start: range.start_pts(),
       end: range.end_pts(),
-      timebase: range.timebase().into(),
+      timebase: Some(range.timebase().into()),
     }
   }
 }
@@ -128,10 +133,13 @@ impl From<crate::TimeRange> for TimeRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ConversionError {
+  /// The message carries no timebase, and a timestamp or a range cannot be
+  /// counted without one.
+  MissingTimebase,
   /// The timebase's numerator is negative.
   NegativeNumerator,
-  /// The timebase's denominator is zero — or absent, which protobuf reads as
-  /// zero.
+  /// The timebase's denominator is zero — or its field absent, which
+  /// protobuf reads as zero.
   ZeroDenominator,
   /// The timebase's denominator is negative.
   NegativeDenominator,
@@ -142,6 +150,7 @@ pub enum ConversionError {
 impl fmt::Display for ConversionError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.write_str(match self {
+      Self::MissingTimebase => "timebase is missing",
       Self::NegativeNumerator => "timebase numerator is negative",
       Self::ZeroDenominator => "timebase denominator is zero",
       Self::NegativeDenominator => "timebase denominator is negative",
@@ -170,22 +179,31 @@ impl TryFrom<Timebase> for crate::Timebase {
 }
 
 /// The checked conversion: the wire timestamp as a [`crate::Timestamp`], or
-/// what its timebase fails. Every count is a legal PTS.
+/// what its timebase fails — its absence included. Every count is a legal
+/// PTS.
 impl TryFrom<Timestamp> for crate::Timestamp {
   type Error = ConversionError;
 
   fn try_from(timestamp: Timestamp) -> Result<Self, ConversionError> {
-    Ok(Self::new(timestamp.pts, timestamp.timebase.try_into()?))
+    let timebase = timestamp
+      .timebase
+      .ok_or(ConversionError::MissingTimebase)?
+      .try_into()?;
+    Ok(Self::new(timestamp.pts, timebase))
   }
 }
 
 /// The checked conversion: the wire range as a [`crate::TimeRange`] — its
-/// timebase judged first, then the order of its endpoints.
+/// timebase judged first, its absence included, then the order of its
+/// endpoints.
 impl TryFrom<TimeRange> for crate::TimeRange {
   type Error = ConversionError;
 
   fn try_from(range: TimeRange) -> Result<Self, ConversionError> {
-    let timebase = range.timebase.try_into()?;
+    let timebase = range
+      .timebase
+      .ok_or(ConversionError::MissingTimebase)?
+      .try_into()?;
     Self::try_new(range.start, range.end, timebase).ok_or(ConversionError::InvertedRange)
   }
 }
@@ -266,10 +284,12 @@ impl Message for Timestamp {
     if self.pts != 0 {
       size += 1 + int64_encoded_len(self.pts) as u32;
     }
-    let slot = cache.reserve();
-    let inner = self.timebase.compute_size(cache);
-    cache.set(slot, inner);
-    size += 1 + varint_len(inner as u64) as u32 + inner;
+    if let Some(timebase) = &self.timebase {
+      let slot = cache.reserve();
+      let inner = timebase.compute_size(cache);
+      cache.set(slot, inner);
+      size += 1 + varint_len(inner as u64) as u32 + inner;
+    }
     size
   }
 
@@ -278,9 +298,11 @@ impl Message for Timestamp {
       Tag::new(1, WireType::Varint).encode(buf);
       encode_int64(self.pts, buf);
     }
-    Tag::new(2, WireType::LengthDelimited).encode(buf);
-    encode_varint(cache.consume_next() as u64, buf);
-    self.timebase.write_to(cache, buf);
+    if let Some(timebase) = &self.timebase {
+      Tag::new(2, WireType::LengthDelimited).encode(buf);
+      encode_varint(cache.consume_next() as u64, buf);
+      timebase.write_to(cache, buf);
+    }
   }
 
   fn merge_field(
@@ -308,7 +330,10 @@ impl Message for Timestamp {
             actual: tag.wire_type() as u8,
           });
         }
-        buffa::Message::merge_length_delimited(&mut self.timebase, buf, ctx)?;
+        // A message field's first occurrence starts from protobuf's zero
+        // message; every later one merges into it.
+        let timebase = self.timebase.get_or_insert_with(Timebase::default);
+        buffa::Message::merge_length_delimited(timebase, buf, ctx)?;
       }
       _ => skip_field_depth(tag, buf, ctx.depth())?,
     }
@@ -337,11 +362,13 @@ impl Message for TimeRange {
     if self.end != 0 {
       size += 1 + int64_encoded_len(self.end) as u32;
     }
-    // timebase (field 3) — always encoded for unconditional round-trip.
-    let slot = cache.reserve();
-    let inner = self.timebase.compute_size(cache);
-    cache.set(slot, inner);
-    size += 1 + varint_len(inner as u64) as u32 + inner;
+    // timebase (field 3), when present: absence survives the round trip.
+    if let Some(timebase) = &self.timebase {
+      let slot = cache.reserve();
+      let inner = timebase.compute_size(cache);
+      cache.set(slot, inner);
+      size += 1 + varint_len(inner as u64) as u32 + inner;
+    }
     size
   }
 
@@ -354,9 +381,11 @@ impl Message for TimeRange {
       Tag::new(2, WireType::Varint).encode(buf);
       encode_int64(self.end, buf);
     }
-    Tag::new(3, WireType::LengthDelimited).encode(buf);
-    encode_varint(cache.consume_next() as u64, buf);
-    self.timebase.write_to(cache, buf);
+    if let Some(timebase) = &self.timebase {
+      Tag::new(3, WireType::LengthDelimited).encode(buf);
+      encode_varint(cache.consume_next() as u64, buf);
+      timebase.write_to(cache, buf);
+    }
   }
 
   fn merge_field(
@@ -394,7 +423,10 @@ impl Message for TimeRange {
             actual: tag.wire_type() as u8,
           });
         }
-        buffa::Message::merge_length_delimited(&mut self.timebase, buf, ctx)?;
+        // A message field's first occurrence starts from protobuf's zero
+        // message; every later one merges into it.
+        let timebase = self.timebase.get_or_insert_with(Timebase::default);
+        buffa::Message::merge_length_delimited(timebase, buf, ctx)?;
       }
       _ => skip_field_depth(tag, buf, ctx.depth())?,
     }
