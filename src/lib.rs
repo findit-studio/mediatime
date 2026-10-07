@@ -17,7 +17,7 @@ use core::{
   cmp::Ordering,
   fmt,
   hash::{Hash, Hasher},
-  num::NonZeroI32,
+  num::{NonZeroI32, NonZeroI128},
   time::Duration as StdDuration,
 };
 
@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 mod parse;
 
 pub use parse::{
-  ParseDurationError, ParseRateError, ParseSignedDurationError, ParseTimeRangeError,
-  ParseTimebaseError, ParseTimestampError,
+  ParseDurationError, ParseRateError, ParseSecondsError, ParseSignedDurationError,
+  ParseTimeRangeError, ParseTimebaseError, ParseTimestampError,
 };
 
 /// Nanoseconds in a second — the factor that turns a [`StdDuration`] into ticks
@@ -49,6 +49,19 @@ const fn nz(n: i32) -> NonZeroI32 {
   }
 }
 
+/// `NonZeroI128` from a value its caller has already proved positive — the
+/// denominators [`ExactSeconds`] reduces, which a gcd of at most themselves
+/// divides into at least 1.
+///
+/// # Panics
+///
+/// Panics if `n == 0`, which no call site can pass.
+const fn nz128(n: i128) -> NonZeroI128 {
+  match NonZeroI128::new(n) {
+    Some(v) => v,
+    None => unreachable!(),
+  }
+}
 /// `NonZeroI32` for 1: the default denominator, and the clamp target when a
 /// malformed denominator arrives on the wire.
 ///
@@ -96,6 +109,34 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// into the numerator via `av_reduce`; that is a convention rather than a type
 /// guarantee, and `AVRational` is laxer than this crate needs because it also
 /// serves aspect ratios. Here it is a type-level guarantee instead.
+///
+/// ## Why a zero numerator is legal
+///
+/// A `0/den` timebase measures nothing — every tick of it is zero seconds —
+/// and it is still a value this type holds, for two reasons. `0/1` is what
+/// libavformat leaves in a stream's `time_base` when the container declared
+/// none, so a reader that reports a stream's timebase as declared has to be
+/// able to say it. And every way in reads what construction accepts, no more
+/// and no less: serde's `Deserialize` refuses a negative numerator because
+/// [`Self::new`] does, and reads a zero one because [`Self::new`] builds it,
+/// so a value this crate writes always reads back. A field where zero cannot
+/// mean "undeclared" — a frame rate, a document that requires a real ruler —
+/// refuses it there, where that rule belongs.
+///
+/// Every road states what it does with one:
+///
+/// | road | with a zero numerator |
+/// |---|---|
+/// | construction, `==`, [`Ord`], [`Hash`], `Display`, `FromStr`, serde, `buffa` through `wire` | legal: every `0/den` equals every other, sorts below every other timebase, and round-trips |
+/// | a rescale *into* it — the rescale ladders, every type's `rescale_to`, `checked_rescale_to` and `checked_rescale_with`, and the span and shift arithmetic that recounts an operand into it | the `checked_` rung answers `None` and the saturating rung panics, as a zero divisor does; arithmetic within one identical degenerate timebase recounts nothing and stays exact |
+/// | a rescale *out of* it | tick `0`: every count of it names instant zero |
+/// | [`checked_duration_to_pts`](Self::checked_duration_to_pts), [`Duration::checked_from_std`], and their saturating twins | `None`, and a panic |
+/// | [`checked_pts_to_duration`](Self::checked_pts_to_duration), [`Duration::checked_to_std`], [`Timestamp::duration`] | zero — though the first still refuses a negative count for its sign |
+/// | [`checked_recip`](Self::checked_recip) and [`Rate`]'s reciprocal roads | `None` from the `checked_` ones, a panic from the rest: there is no reciprocal |
+/// | the `cmp_semantic`s, [`Timestamp`]'s `==`, the [`TimeRange`] predicates | every count names instant zero, or measures zero |
+/// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
+/// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
+/// | [`Rate::as_f64`] | `0.0` |
 ///
 /// # Equality and ordering
 ///
@@ -516,6 +557,9 @@ impl Timebase {
   /// - a `to` whose numerator is zero — a degenerate timebase names one single
   ///   instant, so no tick count in it can represent a non-zero one.
   ///
+  /// A degenerate `self` is not one of them: every count of it names instant
+  /// zero, which is tick `0` of any `to`.
+  ///
   /// [`Self::saturating_rescale`] is the same arithmetic with the other
   /// posture toward the first of those.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -557,6 +601,56 @@ impl Timebase {
     } else {
       q as i64
     }
+  }
+
+  /// Rescales `pts` from this timebase to `to`, rounding as `rounding` says,
+  /// or `None` if the answer is not an `i64`.
+  ///
+  /// [`Self::checked_rescale`] with the rounding named rather than fixed: the
+  /// exact quotient is formed the same way, in `i128` from the same operands,
+  /// and rounded once. Under [`Rounding::Nearest`] the two agree for every
+  /// input. Rescaling `1/1000` ticks into `1/3` ticks sends `400` to `1`
+  /// under [`Rounding::Floor`] and to `2` under [`Rounding::Ceil`], and `-400`
+  /// to `-2` and `-1`: floor and ceiling are directions on the number line,
+  /// whatever the sign.
+  ///
+  /// `None` covers what it covers for [`Self::checked_rescale`]: a quotient
+  /// outside `i64`'s range, and a degenerate `to` (`to.num() == 0`), which
+  /// names one instant and can count no other. Under [`Rounding::Exact`] it
+  /// also covers a quotient that falls between two ticks — see
+  /// [`Self::checked_rescale_exact`]. A degenerate `self` is not a failure:
+  /// every count of it names instant zero, which lands on tick `0` of any
+  /// `to` under every rounding, exactly.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(&self, pts: i64, to: Self, rounding: Rounding) -> Option<i64> {
+    if to.num == 0 {
+      return None;
+    }
+    let numerator = (pts as i128) * (self.num as i128) * (to.den.get() as i128);
+    let denominator = (self.den.get() as i128) * (to.num as i128);
+    match div_rounded(numerator, denominator, rounding) {
+      Some(q) => i128_to_i64(q),
+      None => None,
+    }
+  }
+
+  /// Rescales `pts` from this timebase to `to` only if no rounding occurs:
+  /// `Some` exactly when the instant lands on a tick of `to`, and fits an
+  /// `i64` there.
+  ///
+  /// [`Self::checked_rescale_with`] under [`Rounding::Exact`]. One millisecond
+  /// is 90 ticks of [`MPEG_90K`](Self::MPEG_90K), so `1` rescales; one MPEG
+  /// tick is a ninetieth of a millisecond, so it does not. Thirty 29.97 fps
+  /// frames are exactly 1001 ms, while one frame is 33.366… ms and has no
+  /// millisecond count.
+  ///
+  /// An answer here is a round trip: rescaling it back is exact too, and
+  /// returns `pts` — unless `self` is degenerate, which no rescale can land
+  /// in. A degenerate `to` is refused as it is everywhere; a degenerate
+  /// `self` answers `0`, its every count naming instant zero.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_exact(&self, pts: i64, to: Self) -> Option<i64> {
+    self.checked_rescale_with(pts, to, Rounding::Exact)
   }
 
   /// Converts a [`StdDuration`] into the number of ticks of this timebase that
@@ -774,6 +868,43 @@ impl fmt::Display for Timebase {
   }
 }
 
+/// Which way a value that falls between two ticks goes when it is counted in
+/// them.
+///
+/// A rescale that names no rounding rounds to [`Nearest`](Self::Nearest) —
+/// FFmpeg's default, and the rule [`Timebase::checked_rescale`] has always
+/// taken. The other variants are for the places where *nearest* is the wrong
+/// answer. A trim that must stay inside the stretch it was asked for lands its
+/// start on the first tick at or after the requested instant
+/// ([`Ceil`](Self::Ceil)) and its end on the last tick at or before it
+/// ([`Floor`](Self::Floor)); nearest would let either edge cross by up to half
+/// a tick.
+///
+/// [`Floor`](Self::Floor) and [`Ceil`](Self::Ceil) are directions on the
+/// number line, not toward or away from zero: `-1.5` ticks floors to `-2` and
+/// ceils to `-1`, as `-1.2` does. A value that lands on a tick is the same
+/// tick under every variant.
+///
+/// Marked `#[non_exhaustive]` because FFmpeg's `AVRounding` has more modes
+/// than these (`AV_ROUND_ZERO`, `AV_ROUND_INF`); naming one later must not
+/// break a `match` written against this list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Rounding {
+  /// To the nearest tick, halfway cases away from zero — FFmpeg's
+  /// `AV_ROUND_NEAR_INF`, and the rounding of every rescale that names none.
+  Nearest,
+  /// Toward negative infinity: the last tick at or before the value —
+  /// FFmpeg's `AV_ROUND_DOWN`.
+  Floor,
+  /// Toward positive infinity: the first tick at or after the value —
+  /// FFmpeg's `AV_ROUND_UP`.
+  Ceil,
+  /// No rounding at all: a value that falls between two ticks is refused,
+  /// and only one that lands on a tick is answered. The exact-or-none road,
+  /// for a caller that would rather know than approximate.
+  Exact,
+}
 /// A presentation timestamp, expressed as a PTS value in units of an associated [`Timebase`].
 ///
 /// # Equality and ordering
@@ -857,6 +988,26 @@ impl Timestamp {
     Self {
       pts: self.timebase.saturating_rescale(self.pts, target),
       timebase: target,
+    }
+  }
+
+  /// The same instant counted in `target`, rounded as `rounding` says, or
+  /// `None` where [`Timebase::checked_rescale_with`] has no answer.
+  ///
+  /// The road a trim takes: a start rescaled with [`Rounding::Ceil`] lands on
+  /// the first tick of `target` at or after it, an end rescaled with
+  /// [`Rounding::Floor`] on the last tick at or before it, so the trimmed
+  /// stretch stays inside the one asked for. `None` for a PTS outside `i64` in
+  /// `target`, and for a degenerate `target`, which can count no instant — the
+  /// refusals [`Self::rescale_to`] answers with a clamp and a panic.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(self, target: Timebase, rounding: Rounding) -> Option<Self> {
+    match self
+      .timebase
+      .checked_rescale_with(self.pts, target, rounding)
+    {
+      Some(pts) => Some(Self::new(pts, target)),
+      None => None,
     }
   }
 
@@ -1047,6 +1198,8 @@ impl Timestamp {
   /// negative PTS, which has no [`StdDuration`] representation).
   ///
   /// Equivalent to `self.duration_since(&Timestamp::new(0, self.timebase()))`.
+  /// Under a degenerate `0/den` timebase every PTS names instant zero, so the
+  /// answer is [`StdDuration::ZERO`] for any count, a negative one included.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<StdDuration> {
     self.duration_since(&Self::new(0, self.timebase))
@@ -1437,6 +1590,27 @@ impl SignedDuration {
     }
   }
 
+  /// Returns the same span counted in `target`, rounded as `rounding` says,
+  /// or `None` where [`Timebase::checked_rescale_with`] has no answer.
+  ///
+  /// [`Self::checked_rescale_to`] with the rounding named: under
+  /// [`Rounding::Nearest`] the two agree. A backward span floors and ceils on
+  /// the number line like any count, so `-1.5` ticks floors to `-2` — the
+  /// longer backward span — and ceils to `-1`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(self, target: Timebase, rounding: Rounding) -> Option<Self> {
+    match self
+      .timebase
+      .checked_rescale_with(self.ticks, target, rounding)
+    {
+      Some(ticks) => Some(Self {
+        ticks,
+        timebase: target,
+      }),
+      None => None,
+    }
+  }
+
   /// Compares two spans by the time they measure, rescaling if the timebases
   /// differ — the order this type deliberately has no [`Ord`] for, to be
   /// passed by name: `spans.sort_by(SignedDuration::cmp_semantic)`.
@@ -1687,6 +1861,29 @@ impl Duration {
     }
   }
 
+  /// Returns the same span counted in `target`, rounded as `rounding` says,
+  /// or `None` if the count is not a `u64` or `target` is degenerate.
+  ///
+  /// [`Self::checked_rescale_to`] with the rounding named, over the full
+  /// `u64` range that one covers: under [`Rounding::Nearest`] the two agree.
+  /// A degenerate `self.timebase()` measures zero, which is tick `0` of any
+  /// `target` under every rounding.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_rescale_with(self, target: Timebase, rounding: Rounding) -> Option<Self> {
+    if target.num == 0 {
+      return None;
+    }
+    let numerator = (self.ticks as u128) * (self.timebase.num as u128) * (target.den.get() as u128);
+    let denominator = (self.timebase.den.get() as u128) * (target.num as u128);
+    match div_rounded_unsigned(numerator, denominator, rounding) {
+      Some(q) if q <= u64::MAX as u128 => Some(Self {
+        ticks: q as u64,
+        timebase: target,
+      }),
+      _ => None,
+    }
+  }
+
   /// Compares two spans by the time they measure, rescaling if the timebases
   /// differ — the order this type deliberately has no [`Ord`] for, to be
   /// passed by name: `spans.sort_by(Duration::cmp_semantic)`.
@@ -1883,15 +2080,423 @@ impl fmt::Display for Duration {
   }
 }
 
+/// An exact, signed number of seconds: a rational held in lowest terms, with
+/// no timebase of its own — the sum that does not round.
+///
+/// Two spans counted in different timebases cannot be added in either one
+/// without rounding the other into it: [`SignedDuration::checked_add`]
+/// rescales its right operand to the nearest tick of the left's timebase,
+/// and a running total built that way drifts by up to half a tick per term.
+/// Every [`Timestamp`], [`SignedDuration`] and [`Duration`] folds into this
+/// type exactly, whatever its timebase, and the total is read back into a
+/// timebase once, at the end, by the [`Rounding`] the caller names.
+///
+/// ```
+/// use mediatime::{ExactSeconds, Rounding, SignedDuration, Timebase};
+///
+/// // 1001 ms and one 29.97 fps frame (1001/30000 s): 31031/30000 s together.
+/// let ms = ExactSeconds::from_signed_duration(SignedDuration::new(1001, Timebase::MILLIS));
+/// let frame = ExactSeconds::from_signed_duration(SignedDuration::new(1, Timebase::NTSC_VIDEO));
+/// let total = ms.checked_add(frame).unwrap();
+/// assert_eq!((total.num(), total.den().get()), (31_031, 30_000));
+///
+/// // 1034.366… ms, read back the way the caller says.
+/// let floor = total.checked_to_signed_duration(Timebase::MILLIS, Rounding::Floor);
+/// let ceil = total.checked_to_signed_duration(Timebase::MILLIS, Rounding::Ceil);
+/// assert_eq!(floor, Some(SignedDuration::new(1034, Timebase::MILLIS)));
+/// assert_eq!(ceil, Some(SignedDuration::new(1035, Timebase::MILLIS)));
+/// ```
+///
+/// # Instants and spans
+///
+/// The value is a number of seconds and does not say which of the two it is.
+/// [`Self::from_timestamp`] reads an instant as its offset from PTS zero, the
+/// reading [`Timestamp::duration`] takes, so an instant plus spans is an
+/// instant again, and [`Self::checked_to_timestamp`] hands it back as one.
+///
+/// # Range
+///
+/// The numerator and denominator are `i128`. A term folds in as
+/// `ticks · num / den` — a numerator under `2^94` over a denominator under
+/// `2^31` — and a sum's denominator is the least common multiple of its
+/// terms'. The timebases media declares share their prime factors (the whole
+/// [roster](Timebase#the-well-known-roster)'s denominators have an lcm under
+/// `2^39`), so a total over them has room for any `i64` count. Denominators
+/// with no factor in common multiply instead, and an operation whose exact
+/// intermediate would leave `i128` answers `None` rather than a wrong value.
+///
+/// # Equality and ordering
+///
+/// The value is kept in lowest terms with a positive denominator, so it has
+/// one representation per number: equality and [`Hash`] are structural, and
+/// structural is value-based here. [`Ord`] compares the numbers exactly, by
+/// Euclid's algorithm rather than a cross-multiplication that could overflow.
+///
+/// There is no `Display` or `FromStr`: a number of seconds has no one exact
+/// spelling this crate writes — a decimal exists for `1/8` and not for
+/// `1/3` — so [`Self::num`] and [`Self::den`] hand the value out instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExactSeconds {
+  num: i128,
+  den: NonZeroI128,
+}
+
+impl Default for ExactSeconds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn default() -> Self {
+    Self::ZERO
+  }
+}
+
+impl ExactSeconds {
+  /// No time at all: `0/1` seconds.
+  pub const ZERO: Self = Self {
+    num: 0,
+    den: nz128(1),
+  };
+
+  /// The instant `ts` names, as its offset from PTS zero: `pts · num / den`
+  /// seconds, exactly.
+  ///
+  /// Total: the product of an `i64` count and an `i32` numerator always fits.
+  /// An instant counted in a degenerate `0/den` timebase is instant zero, and
+  /// folds in as [`Self::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from_timestamp(ts: Timestamp) -> Self {
+    Self::of_count(ts.pts, ts.timebase)
+  }
+
+  /// The span `d` measures, in seconds, exactly — negative when it points
+  /// backwards.
+  ///
+  /// Total, as [`Self::from_timestamp`] is; a span counted in a degenerate
+  /// timebase measures zero and folds in as [`Self::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from_signed_duration(d: SignedDuration) -> Self {
+    Self::of_count(d.ticks, d.timebase)
+  }
+
+  /// The span `d` measures, in seconds, exactly.
+  ///
+  /// Total: a `u64` count times an `i32` numerator is under `2^95`. A span
+  /// counted in a degenerate timebase folds in as [`Self::ZERO`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn from_duration(d: Duration) -> Self {
+    Self::reduced(
+      (d.ticks as i128) * (d.timebase.num as i128),
+      d.timebase.den.get() as i128,
+    )
+  }
+
+  /// The numerator, in lowest terms — negative for a negative number of
+  /// seconds, zero for zero.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn num(&self) -> i128 {
+    self.num
+  }
+
+  /// The denominator, in lowest terms: always positive, and `1` for a whole
+  /// number of seconds.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn den(&self) -> NonZeroI128 {
+    self.den
+  }
+
+  /// The exact sum, or `None` if an intermediate of it leaves `i128`.
+  ///
+  /// Nothing is rounded: the two are brought over a common denominator, the
+  /// least common multiple of theirs, and the sum is reduced again.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_add(self, rhs: Self) -> Option<Self> {
+    self.combine(rhs, false)
+  }
+
+  /// The exact difference, or `None` if an intermediate of it leaves `i128`.
+  ///
+  /// Not an addition of a negated `rhs`, which `i128::MIN` has no room for.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
+    self.combine(rhs, true)
+  }
+
+  /// These seconds as an instant counted in `timebase`, rounded as
+  /// `rounding` says, or `None` if the count is not an `i64` or `timebase` is
+  /// degenerate.
+  ///
+  /// The one rounding a total built here goes through — or none, under
+  /// [`Rounding::Exact`], which answers only seconds that land on a tick. A
+  /// degenerate `timebase` (`num() == 0`) names one instant and can count no
+  /// other, so it is refused under every rounding, as
+  /// [`Timebase::checked_rescale`] refuses it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_to_timestamp(
+    self,
+    timebase: Timebase,
+    rounding: Rounding,
+  ) -> Option<Timestamp> {
+    match self.ticks_in(timebase, rounding) {
+      Some(ticks) => match i128_to_i64(ticks) {
+        Some(pts) => Some(Timestamp::new(pts, timebase)),
+        None => None,
+      },
+      None => None,
+    }
+  }
+
+  /// These seconds as a span counted in `timebase`, rounded as `rounding`
+  /// says, or `None` if the count is not an `i64` or `timebase` is
+  /// degenerate.
+  ///
+  /// A negative number of seconds is a backward span, and floors and ceils on
+  /// the number line as any count does. Under [`Rounding::Exact`], seconds
+  /// that fall between two ticks are refused.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_to_signed_duration(
+    self,
+    timebase: Timebase,
+    rounding: Rounding,
+  ) -> Option<SignedDuration> {
+    match self.ticks_in(timebase, rounding) {
+      Some(ticks) => match i128_to_i64(ticks) {
+        Some(ticks) => Some(SignedDuration::new(ticks, timebase)),
+        None => None,
+      },
+      None => None,
+    }
+  }
+
+  /// These seconds as an unsigned span counted in `timebase`, rounded as
+  /// `rounding` says, or `None` if the rounded count is negative or past
+  /// `u64::MAX`, or `timebase` is degenerate.
+  ///
+  /// The rounded count decides, not the sign of the seconds: `-0.4` ticks
+  /// ceils to a zero-length span, which a [`Duration`] holds. Under
+  /// [`Rounding::Exact`], seconds that fall between two ticks are refused.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_to_duration(
+    self,
+    timebase: Timebase,
+    rounding: Rounding,
+  ) -> Option<Duration> {
+    match self.ticks_in(timebase, rounding) {
+      Some(ticks) if ticks >= 0 && ticks <= u64::MAX as i128 => {
+        Some(Duration::new(ticks as u64, timebase))
+      }
+      _ => None,
+    }
+  }
+
+  /// `ticks` of `timebase` in seconds, reduced. Every product fits: an `i64`
+  /// count times an `i32` numerator is under `2^94`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn of_count(ticks: i64, timebase: Timebase) -> Self {
+    Self::reduced(
+      (ticks as i128) * (timebase.num as i128),
+      timebase.den.get() as i128,
+    )
+  }
+
+  /// `num / den` in lowest terms. `den` must be positive, which makes the gcd
+  /// at least 1 and at most `den`, so both divisions are exact and in range —
+  /// `i128::MIN / 1` included.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn reduced(num: i128, den: i128) -> Self {
+    let g = gcd_u128(num.unsigned_abs(), den as u128) as i128;
+    Self {
+      num: num / g,
+      den: nz128(den / g),
+    }
+  }
+
+  /// `self ± rhs` over the least common multiple of the denominators:
+  /// `a/b ± c/d = (a·(d/g) ± c·(b/g)) / ((b/g)·d)` with `g = gcd(b, d)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn combine(self, rhs: Self, subtract: bool) -> Option<Self> {
+    let (b, d) = (self.den.get(), rhs.den.get());
+    let g = gcd_u128(b as u128, d as u128) as i128;
+    let den = match (b / g).checked_mul(d) {
+      Some(den) => den,
+      None => return None,
+    };
+    let left = match self.num.checked_mul(d / g) {
+      Some(left) => left,
+      None => return None,
+    };
+    let right = match rhs.num.checked_mul(b / g) {
+      Some(right) => right,
+      None => return None,
+    };
+    let num = if subtract {
+      left.checked_sub(right)
+    } else {
+      left.checked_add(right)
+    };
+    match num {
+      Some(num) => Some(Self::reduced(num, den)),
+      None => None,
+    }
+  }
+
+  /// These seconds in ticks of `timebase`, rounded: `num · tb.den / (den ·
+  /// tb.num)`, by long division, so neither product is ever formed and a
+  /// small answer is found however large the denominators behind it are.
+  /// `None` for a degenerate `timebase`, for a value between two ticks under
+  /// [`Rounding::Exact`], and for a count whose magnitude leaves `i128`.
+  ///
+  /// The timebase is reduced first — `n/n` is one second a tick — and the
+  /// value's magnitude `m/den` is taken through it in two exact steps:
+  /// `m · tb.den = q1 · den + r1`, then `q1 = q2 · tb.num + r2`. The count's
+  /// floor is `q2`, and what is left over is
+  /// `(r2 + r1/den) / tb.num`, in `[0, 1)`, which is all any rounding needs
+  /// to know: whether it is zero, and how it stands against one half.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn ticks_in(self, timebase: Timebase, rounding: Rounding) -> Option<i128> {
+    if timebase.num == 0 {
+      return None;
+    }
+    let timebase = timebase.reduce();
+    let (per_second, seconds_per) = (timebase.den.get() as u128, timebase.num as u128);
+    let den = self.den.get() as u128;
+    let (q1, r1) = match mul_div_u128(self.num.unsigned_abs(), per_second, den) {
+      Some(qr) => qr,
+      None => return None,
+    };
+    let (floor, r2) = (q1 / seconds_per, q1 % seconds_per);
+    let whole = r1 == 0 && r2 == 0;
+    // The leftover against one half: `(r2 + r1/den) / seconds_per` vs `1/2`,
+    // that is `2·r2 + 2·r1/den` vs `seconds_per`, with `2·r1/den` in `[0, 2)`.
+    let twice = 2 * r2;
+    let half = if twice + 2 <= seconds_per {
+      Ordering::Less
+    } else if twice > seconds_per {
+      Ordering::Greater
+    } else if twice == seconds_per {
+      if r1 == 0 {
+        Ordering::Equal
+      } else {
+        Ordering::Greater
+      }
+    } else {
+      // `twice + 1 == seconds_per`: the leftover is half exactly when
+      // `2·r1/den` is one. `r1 < den <= i128::MAX`, so `2·r1` fits.
+      cmp_u128(2 * r1, den)
+    };
+    // The magnitude rounded, with "away from zero" as "up" — the sign is put
+    // back below, which turns a floor of the magnitude into a ceiling of a
+    // negative count and the other way round.
+    let negative = self.num < 0;
+    let up = match rounding {
+      Rounding::Exact => {
+        if !whole {
+          return None;
+        }
+        false
+      }
+      Rounding::Nearest => !half.is_lt(),
+      Rounding::Floor => !whole && negative,
+      Rounding::Ceil => !whole && !negative,
+    };
+    let magnitude = if up {
+      match floor.checked_add(1) {
+        Some(magnitude) => magnitude,
+        None => return None,
+      }
+    } else {
+      floor
+    };
+    if negative {
+      if magnitude > i128::MAX as u128 + 1 {
+        None
+      } else {
+        Some((magnitude as i128).wrapping_neg())
+      }
+    } else if magnitude > i128::MAX as u128 {
+      None
+    } else {
+      Some(magnitude as i128)
+    }
+  }
+}
+
+impl PartialOrd for ExactSeconds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for ExactSeconds {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn cmp(&self, other: &Self) -> Ordering {
+    cmp_fractions(self.num, self.den.get(), other.num, other.den.get())
+  }
+}
+/// Returned when a change to a [`TimeRange`] would put its `end` before its
+/// `start`.
+///
+/// A range's endpoints are ordered by construction: [`TimeRange::try_new`],
+/// [`TimeRange::try_with_start`] and their kin answer with this rather than
+/// hand out an inverted range, and serde reads one as this error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InvertedRange(());
+
+impl fmt::Display for InvertedRange {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("time range end must not precede start")
+  }
+}
+
+impl core::error::Error for InvertedRange {}
+
 /// A half-open time range `[start, end)` in a given [`Timebase`].
 ///
 /// Represents the extent of a detected event — for example, a fade-out →
 /// fade-in span. When `start == end`, the range is degenerate (an instant);
 /// see [`Self::instant`].
 ///
-/// Both endpoints share the same [`Timebase`]. To compare ranges across
-/// different timebases, rescale one of them first (e.g., by calling
-/// [`Timestamp::rescale_to`] on each endpoint).
+/// Both endpoints share the same [`Timebase`]. The predicates below compare
+/// against ranges and instants counted in any timebase, exactly, by the
+/// 128-bit cross-multiplication [`Timestamp`]'s order uses: nothing needs
+/// rescaling first, and nothing is rounded.
+///
+/// # Where a range sits
+///
+/// The algebra is ingraph's `MediaTimeRangeFilter`'s, operator for operator,
+/// so an in-memory test and a filtered read agree; `self` is the range, the
+/// argument the operand:
+///
+/// | method | operand | true when |
+/// |---|---|---|
+/// | [`contains_instant`](Self::contains_instant) | an instant `t` | `start <= t && t < end` |
+/// | [`contains`](Self::contains) | a range `[a, b)` | `start <= a && end >= b` |
+/// | [`overlaps`](Self::overlaps) | a range `[a, b)` | `start < b && end > a` |
+/// | [`within`](Self::within) | a range `[a, b)` | `start >= a && end <= b` |
+/// | [`before`](Self::before) | an instant `t` | `end <= t` |
+/// | [`after`](Self::after) | an instant `t` | `start >= t` |
+///
+/// The half-openness shows through in three places, all deliberate. An
+/// instant at `start` is contained and one at `end` is not, so an instant
+/// belongs to exactly one of two abutting ranges. `overlaps` is strict at
+/// both ends, so `[0, 10)` and `[10, 20)` abut without overlapping. `contains`
+/// and `within` admit coinciding ends, so a range contains itself.
+///
+/// A **zero-length range** `[a, a)` follows from the same formulas rather
+/// than from a rule of its own:
+///
+/// - it contains no instant, not even `a`;
+/// - it overlaps a range `[x, y)` only when `x < a < y` — never at either end
+///   of it, and never another zero-length range;
+/// - `[x, y)` contains it whenever `x <= a <= y`, its own end included, and
+///   it is then `within` `[x, y)`.
+///
+/// The predicates read the instants the endpoints name, not the counts:
+/// under a degenerate `0/den` timebase both endpoints name instant zero, so
+/// such a range is the zero-length range at zero whatever its counts.
+///
+/// Two readings a caller may want are **not** this type's to decide: an
+/// open-ended range (one with no end yet) is not representable here, and
+/// whether a window of no length "sits at" an instant it touches is a
+/// product rule. Both belong to the caller, on top of these predicates.
 ///
 /// # Equality and ordering
 ///
@@ -1934,32 +2539,6 @@ impl TimeRange {
   pub const fn new(start: i64, end: i64, timebase: Timebase) -> Self {
     assert!(start <= end, "end must not precede start");
 
-    Self {
-      start,
-      end,
-      timebase,
-    }
-  }
-
-  /// Bypass-invariant constructor used only by the `buffa` decode path.
-  ///
-  /// During protobuf field-by-field merging, intermediate states may
-  /// temporarily violate `start <= end` (e.g. `start` field arrives before
-  /// `end`, so the partially-decoded struct holds `start=100, end=0`).
-  /// The normal `new()` constructor panics in that case. This constructor
-  /// skips the assertion so decode can proceed.
-  ///
-  /// The *final* value is consistent only when the peer is this crate's own
-  /// encoder, which never writes `start > end`. A foreign or hostile peer
-  /// can write one, and nothing downstream of the last `merge_field` call
-  /// re-checks — so a decoded range can violate the invariant, and
-  /// [`Self::duration`] then panics on it. Closing that needs a policy this
-  /// decoder does not have yet: its other malformed-input arms *clamp* to
-  /// stay total (see `buffa.rs`), and there is no obvious clamp for an
-  /// inverted range.
-  #[cfg(feature = "buffa")]
-  #[inline(always)]
-  pub(crate) const fn new_for_decode(start: i64, end: i64, timebase: Timebase) -> Self {
     Self {
       start,
       end,
@@ -2022,31 +2601,84 @@ impl TimeRange {
     Timestamp::new(self.end, self.timebase)
   }
 
-  /// Sets the start PTS.
+  /// Moves the start to `start`, or refuses with [`InvertedRange`] if that
+  /// would put it after the end.
+  ///
+  /// An endpoint moves only through a road that keeps the order — there is no
+  /// unchecked setter:
+  ///
+  /// ```compile_fail,E0599
+  /// use mediatime::{TimeRange, Timebase};
+  ///
+  /// let r = TimeRange::new(0, 1, Timebase::MILLIS).with_start(2);
+  /// ```
+  ///
+  /// To move both ends past each other, which no order of single moves can
+  /// do, use [`Self::with_bounds`].
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_start(mut self, val: i64) -> Self {
-    self.start = val;
-    self
+  pub const fn try_with_start(self, start: i64) -> Result<Self, InvertedRange> {
+    match Self::try_new(start, self.end, self.timebase) {
+      Some(range) => Ok(range),
+      None => Err(InvertedRange(())),
+    }
   }
 
-  /// Sets the start PTS in place.
+  /// Moves the end to `end`, or refuses with [`InvertedRange`] if that would
+  /// put it before the start.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_start(&mut self, val: i64) -> &mut Self {
-    self.start = val;
-    self
+  pub const fn try_with_end(self, end: i64) -> Result<Self, InvertedRange> {
+    match Self::try_new(self.start, end, self.timebase) {
+      Some(range) => Ok(range),
+      None => Err(InvertedRange(())),
+    }
   }
 
-  /// Sets the end PTS.
+  /// Moves the start to `start` in place, or refuses with [`InvertedRange`]
+  /// and leaves the range as it was.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_end(mut self, val: i64) -> Self {
-    self.end = val;
-    self
+  pub const fn try_set_start(&mut self, start: i64) -> Result<&mut Self, InvertedRange> {
+    if start <= self.end {
+      self.start = start;
+      Ok(self)
+    } else {
+      Err(InvertedRange(()))
+    }
   }
 
-  /// Sets the end PTS in place.
+  /// Moves the end to `end` in place, or refuses with [`InvertedRange`] and
+  /// leaves the range as it was.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_end(&mut self, val: i64) -> &mut Self {
-    self.end = val;
+  pub const fn try_set_end(&mut self, end: i64) -> Result<&mut Self, InvertedRange> {
+    if self.start <= end {
+      self.end = end;
+      Ok(self)
+    } else {
+      Err(InvertedRange(()))
+    }
+  }
+
+  /// Both endpoints at once, in the same timebase: the move from `[0, 10)` to
+  /// `[20, 30)` that one end at a time would refuse halfway.
+  ///
+  /// [`Self::try_new`] with this range's timebase is the fallible form.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `end < start`, as [`Self::new`] does.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_bounds(self, start: i64, end: i64) -> Self {
+    Self::new(start, end, self.timebase)
+  }
+
+  /// Both endpoints at once, in place — [`Self::with_bounds`] on `self`.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `end < start`, as [`Self::new`] does, leaving the range as it
+  /// was.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_bounds(&mut self, start: i64, end: i64) -> &mut Self {
+    *self = Self::new(start, end, self.timebase);
     self
   }
 
@@ -2070,6 +2702,73 @@ impl TimeRange {
     self.start == self.end
   }
 
+  /// Whether `t` falls inside the range: `start <= t && t < end`.
+  ///
+  /// An instant at `start` is inside and one at `end` is not — the
+  /// half-openness that puts an instant in exactly one of two abutting
+  /// ranges. A zero-length range contains no instant at all. `t` may be
+  /// counted in any timebase; the comparison is exact. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn contains_instant(&self, t: &Timestamp) -> bool {
+    self.start().cmp_semantic(t).is_le() && t.cmp_semantic(&self.end()).is_lt()
+  }
+
+  /// Whether `other` lies inside this range: `start <= other.start` and
+  /// `end >= other.end`.
+  ///
+  /// Coinciding ends are admitted, so a range contains itself; and since a
+  /// zero-length `other` is compared by its one instant at both ends, this
+  /// range contains one at its own `end`, although it does not contain the
+  /// instant there. See [the algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn contains(&self, other: &Self) -> bool {
+    self.start().cmp_semantic(&other.start()).is_le()
+      && self.end().cmp_semantic(&other.end()).is_ge()
+  }
+
+  /// Whether the two ranges overlap: `start < other.end && end > other.start`.
+  ///
+  /// Strict at both ends, so abutting ranges do not overlap, and symmetric.
+  /// A zero-length range overlaps `other` only when it lies strictly inside
+  /// it — not at either end, and never another zero-length range. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn overlaps(&self, other: &Self) -> bool {
+    self.start().cmp_semantic(&other.end()).is_lt()
+      && self.end().cmp_semantic(&other.start()).is_gt()
+  }
+
+  /// Whether this range lies inside `other`: `start >= other.start` and
+  /// `end <= other.end` — [`Self::contains`] read from the other side, so
+  /// `a.within(&b)` is `b.contains(&a)`. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn within(&self, other: &Self) -> bool {
+    other.contains(self)
+  }
+
+  /// Whether the range is over by `t`: `end <= t`.
+  ///
+  /// An `end` at `t` counts, the end being outside the range. With
+  /// [`Self::after`] this is the one-sided half of [`Self::within`]:
+  /// `r.within(&w)` is `r.after(&w.start()) && r.before(&w.end())`. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn before(&self, t: &Timestamp) -> bool {
+    self.end().cmp_semantic(t).is_le()
+  }
+
+  /// Whether the range has not begun before `t`: `start >= t`.
+  ///
+  /// A `start` at `t` counts, so a range can be `after` an instant it also
+  /// contains — the instant at its own start. See [the
+  /// algebra](Self#where-a-range-sits).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn after(&self, t: &Timestamp) -> bool {
+    self.start().cmp_semantic(t).is_ge()
+  }
+
   /// Returns the span in PTS units (`end - start`) in this timebase.
   ///
   /// Always non-negative given the `start <= end` constructor invariant.
@@ -2082,18 +2781,24 @@ impl TimeRange {
 
   /// Returns the elapsed [`StdDuration`] from `start` to `end`.
   ///
-  /// # Panics
-  ///
-  /// Panics if `end` precedes `start`, which every constructor refuses and
-  /// [`Self::rescale_to`] preserves — so this is unreachable for a range
-  /// built through the public API. It is reachable through the `buffa`
-  /// decoder, which admits an inverted range from the wire.
+  /// Total: `start <= end` holds for every range there is — every
+  /// constructor, setter and decoder keeps it — so the span is never
+  /// negative. It is `(end - start) · num / den` seconds, truncated once at
+  /// the nanosecond as [`Timestamp::duration_since`] truncates, and clamped
+  /// at [`StdDuration::MAX`]. A degenerate timebase measures zero.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> StdDuration {
-    self
-      .end()
-      .duration_since(&self.start())
-      .expect("end must not precede start")
+    // In `[0, 2^64)` ticks, and under `2^95` once multiplied by an `i32`
+    // numerator.
+    let ticks = (self.end as i128 - self.start as i128) as u128;
+    let span = ticks * (self.timebase.num as u128);
+    let den = self.timebase.den.get() as u128;
+    let secs = span / den;
+    if secs > u64::MAX as u128 {
+      return StdDuration::MAX;
+    }
+    let nanos = (span % den) * NANOS_PER_SEC / den;
+    StdDuration::new(secs as u64, nanos as u32)
   }
 
   /// Returns a new `TimeRange` representing the same span in a different timebase.
@@ -2432,6 +3137,22 @@ impl Rate {
   pub const fn saturating_frames_to_duration(&self, frames: i64) -> StdDuration {
     self.to_timebase().saturating_pts_to_duration(frames)
   }
+
+  /// The rate as an `f64`, in events per second: `30000/1001` reads
+  /// `29.97002997002997`.
+  ///
+  /// **Lossy**, and for the places that need a float — a label, a pacing
+  /// loop, a format that stores a rate as a double. Most rates have no exact
+  /// binary fraction, so this is the double *nearest* the rational: exactly
+  /// that one, because both halves are exact in an `f64` and IEEE division
+  /// rounds correctly, so equal rates read the same float and a faster rate
+  /// never reads slower. Do not compute with it and convert back; the
+  /// rational is the value, and [`Self::num`] and [`Self::den`] hand it out.
+  /// The degenerate rate reads `0.0`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_f64(&self) -> f64 {
+    self.num() as f64 / self.den().get() as f64
+  }
 }
 
 /// Writes the rate as `num/den` — `30000/1001`, `48000/1`, `24/1`.
@@ -2468,12 +3189,17 @@ impl fmt::Display for Rate {
 /// the violations unrepresentable; `i32`/`NonZeroI32` no longer do.)
 /// [`TimeRange`]'s `start <= end` relates two fields, which no per-field hook
 /// can see, so that one needs the whole struct in hand first.
+///
+/// The validators are no *stricter* than the constructors either: a zero
+/// numerator is read because [`Timebase::new`] builds one, so every value
+/// this crate can write reads back. The [type's
+/// docs](Timebase#why-a-zero-numerator-is-legal) say why it is legal.
 #[cfg(feature = "serde")]
 mod de {
-  use core::{fmt, num::NonZeroI32};
+  use core::num::NonZeroI32;
   use serde::{Deserialize, Deserializer, de::Error};
 
-  use crate::{TimeRange, Timebase};
+  use crate::{InvertedRange, TimeRange, Timebase};
 
   pub(super) fn de_num<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
     let v = i32::deserialize(d)?;
@@ -2503,20 +3229,11 @@ mod de {
     timebase: Timebase,
   }
 
-  /// A [`TimeRange`] arrived with its endpoints in the wrong order.
-  pub(super) struct InvertedRange;
-
-  impl fmt::Display for InvertedRange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-      f.write_str("time range end must not precede start")
-    }
-  }
-
   impl TryFrom<TimeRangeRepr> for TimeRange {
     type Error = InvertedRange;
 
     fn try_from(repr: TimeRangeRepr) -> Result<Self, Self::Error> {
-      Self::try_new(repr.start, repr.end, repr.timebase).ok_or(InvertedRange)
+      Self::try_new(repr.start, repr.end, repr.timebase).ok_or(InvertedRange(()))
     }
   }
 }
@@ -2731,6 +3448,39 @@ const fn saturating_recount_unsigned(ticks: u64, from: Timebase, to: Timebase) -
   }
 }
 
+/// `a/b` against `c/d` for positive `b` and `d`, exactly and without
+/// overflow, where a cross-multiplication of two `i128` fractions could
+/// leave `i128`.
+///
+/// The floor quotients are compared first; when they tie, the fractional
+/// parts `ra/b` and `rc/d` are compared through their reciprocals in the
+/// opposite order (`ra/b < rc/d` exactly when `d/rc < b/ra`). That is
+/// Euclid's algorithm run on both fractions at once: the denominators shrink
+/// every round, so the loop ends.
+const fn cmp_fractions(mut a: i128, mut b: i128, mut c: i128, mut d: i128) -> Ordering {
+  loop {
+    let (qa, ra) = (a.div_euclid(b), a.rem_euclid(b));
+    let (qc, rc) = (c.div_euclid(d), c.rem_euclid(d));
+    if qa != qc {
+      return cmp_i128(qa, qc);
+    }
+    if ra == 0 {
+      return if rc == 0 {
+        Ordering::Equal
+      } else {
+        Ordering::Less
+      };
+    }
+    if rc == 0 {
+      return Ordering::Greater;
+    }
+    let (next_a, next_b, next_c, next_d) = (d, rc, b, ra);
+    a = next_a;
+    b = next_b;
+    c = next_c;
+    d = next_d;
+  }
+}
 /// `const fn` form of [`Ord::cmp`] on `u128` — the unsigned counterpart of
 /// [`cmp_i128`], for the same reason: the semantic comparisons need it in a
 /// `const` context, where the trait method is unavailable.
@@ -2782,6 +3532,121 @@ const fn div_round_half_up(n: u128, d: u128) -> u128 {
   let q = n / d;
   let r = n % d;
   if 2 * r >= d { q + 1 } else { q }
+}
+
+/// `n / d` rounded as `rounding` says, for a strictly positive `d` — `None`
+/// only where [`Rounding::Exact`] meets a quotient that is not whole.
+///
+/// Every arm starts from the floor quotient and its non-negative remainder —
+/// [`i128::div_euclid`] and [`i128::rem_euclid`], which for a positive
+/// divisor are the floor and what it leaves — so the sign of `n` needs no
+/// case analysis beyond the one tie rule.
+///
+/// The nearest arm compares `r` with `d - r` instead of doubling `r`, so it
+/// holds for every `d` up to `i128::MAX` and not only for the products of two
+/// `i32`s that [`div_round_half_away`] is bounded by. Where both apply they
+/// agree; a property test pins that for the whole rescale domain.
+///
+/// No arm overflows: a `q + 1` is only taken with `r > 0`, so `d >= 2` and
+/// `|q| <= |n| / 2`.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn div_rounded(n: i128, d: i128, rounding: Rounding) -> Option<i128> {
+  let q = n.div_euclid(d);
+  let r = n.rem_euclid(d);
+  match rounding {
+    Rounding::Floor => Some(q),
+    Rounding::Ceil => Some(if r == 0 { q } else { q + 1 }),
+    Rounding::Exact => {
+      if r == 0 {
+        Some(q)
+      } else {
+        None
+      }
+    }
+    Rounding::Nearest => {
+      let rest = d - r;
+      Some(if r > rest || (r == rest && n >= 0) {
+        q + 1
+      } else {
+        q
+      })
+    }
+  }
+}
+
+/// `a · b` as `q · c + r` with `0 <= r < c`, without forming `a · b` — or
+/// `None` if `q` leaves `u128`. `b` must be under `2^32` and `c` in
+/// `1..=2^127`.
+///
+/// `a = qa · c + ra` puts `qa · b` in the quotient directly; `ra · b` is
+/// built bit by bit of `b`, doubling and adding `ra`, with the partial
+/// remainder kept under `c`. That bound is what keeps every step in range:
+/// a remainder under `c <= 2^127` doubles, or gains `ra < c`, to under
+/// `2^128`, and the partial quotient never reaches `b`.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn mul_div_u128(a: u128, b: u128, c: u128) -> Option<(u128, u128)> {
+  let (qa, ra) = (a / c, a % c);
+  let base = match qa.checked_mul(b) {
+    Some(base) => base,
+    None => return None,
+  };
+  let mut q: u128 = 0;
+  let mut r: u128 = 0;
+  let mut bit = 32;
+  while bit > 0 {
+    bit -= 1;
+    q *= 2;
+    r *= 2;
+    if r >= c {
+      r -= c;
+      q += 1;
+    }
+    if (b >> bit) & 1 == 1 {
+      r += ra;
+      if r >= c {
+        r -= c;
+        q += 1;
+      }
+    }
+  }
+  match base.checked_add(q) {
+    Some(q) => Some((q, r)),
+    None => None,
+  }
+}
+/// [`div_rounded`] where both operands are non-negative, for the unsigned
+/// counts [`Duration`] carries: the floor is plain division, and "away from
+/// zero" is "up".
+///
+/// `d` must be non-zero, and `None` again means only an inexact quotient under
+/// [`Rounding::Exact`]. As in [`div_rounded`], a `q + 1` is only taken with
+/// `r > 0`, so it cannot overflow.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn div_rounded_unsigned(n: u128, d: u128, rounding: Rounding) -> Option<u128> {
+  let q = n / d;
+  let r = n % d;
+  match rounding {
+    Rounding::Floor => Some(q),
+    Rounding::Ceil => Some(if r == 0 { q } else { q + 1 }),
+    Rounding::Nearest => Some(if r >= d - r { q + 1 } else { q }),
+    Rounding::Exact => {
+      if r == 0 {
+        Some(q)
+      } else {
+        None
+      }
+    }
+  }
+}
+
+/// `q` as an `i64`, or `None` outside its range.
+#[cfg_attr(not(tarpaulin), inline(always))]
+const fn i128_to_i64(q: i128) -> Option<i64> {
+  if q > i64::MAX as i128 || q < i64::MIN as i128 {
+    None
+  } else {
+    Some(q as i64)
+  }
 }
 
 #[cfg_attr(not(tarpaulin), inline(always))]
@@ -3019,17 +3884,6 @@ mod arbitrary_impl_tests;
 #[cfg(feature = "buffa")]
 mod buffa;
 
-/// Ancillary module the buffa code generator looks for when an extern-mapped
-/// type is used as a message field with view generation enabled. The mediatime
-/// types contain only scalars, so each view is the owned type itself.
 #[cfg(feature = "buffa")]
-#[doc(hidden)]
-pub mod __buffa {
-  pub mod view {
-    // `'a` is required by buffa's extern-view convention; unused here
-    // because these mediatime types are `Copy`/owned (nothing borrowed).
-    pub type TimebaseView<'a> = crate::Timebase;
-    pub type TimeRangeView<'a> = crate::TimeRange;
-    pub type TimestampView<'a> = crate::Timestamp;
-  }
-}
+#[cfg_attr(docsrs, doc(cfg(feature = "buffa")))]
+pub mod wire;

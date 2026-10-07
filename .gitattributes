@@ -1,0 +1,3 @@
+# The generator writes LF. Kept LF in every checkout, so the copy under
+# tests/codegen/ stays byte-equal to its output on every platform.
+tests/codegen/** text eol=lf

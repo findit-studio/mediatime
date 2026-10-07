@@ -6,6 +6,105 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0]
+
+### Added
+
+- `Rounding { Nearest, Floor, Ceil, Exact }` (`#[non_exhaustive]`) — which
+  way a value that falls between two ticks goes. `Nearest` is FFmpeg's
+  `AV_ROUND_NEAR_INF`, the rule every rescale that names none keeps;
+  `Floor` and `Ceil` are directions on the number line at either sign;
+  `Exact` refuses a value between ticks.
+- Directed rescales: `Timebase::checked_rescale_with(pts, to, rounding)`,
+  and `checked_rescale_with(target, rounding)` on `Timestamp`,
+  `SignedDuration` and `Duration` (the last over its full `u64` range).
+  `checked_rescale` is unchanged; a property pins that naming `Nearest`
+  reproduces it for every input.
+- `Timebase::checked_rescale_exact(pts, to)` — the exact-or-none rescale:
+  `Some` only when the instant lands on a tick of `to`, and an answer
+  rescales back exactly.
+- `ExactSeconds` — an exact, signed number of seconds (`i128` over a
+  positive `i128`, in lowest terms): the sum across timebases that does not
+  round, where `SignedDuration::checked_add` rescales its right operand to
+  the nearest tick. `from_timestamp`/`from_signed_duration`/`from_duration`
+  fold in exactly; `checked_add`/`checked_sub` stay exact or answer `None`;
+  `checked_to_timestamp`/`checked_to_signed_duration`/`checked_to_duration`
+  read the total back once, by a `Rounding` — by long division, so every
+  count that fits answers however large the denominators behind it. `Ord`
+  compares by Euclid's algorithm, so denominators whose cross product leaves
+  `i128` still order exactly.
+- `TimeRange::{contains_instant, contains, overlaps, within, before,
+  after}` — ingraph's `MediaTimeRangeFilter` algebra in memory, operator for
+  operator, compared exactly across timebases. The type's docs carry the
+  table and every degenerate case: an instant at `start` and at `end`,
+  abutting ranges, zero-length ranges, a range in a degenerate timebase.
+- `Timestamp::parse_seconds(text, timebase, rounding)` — decimal seconds
+  read exactly, as integers rather than through a float, and counted in
+  `timebase` by the rounding named. `ParseSecondsError` (`#[non_exhaustive]`:
+  `NotDecimal`, `BetweenTicks`, `OutOfRange`, `DegenerateTimebase`) says
+  why a text was refused — `BetweenTicks` is the refusal by name under
+  `Rounding::Exact`.
+- `Rate::as_f64` — the double nearest a rate, for the places that need a
+  float; lossy, and documented as such.
+- `mediatime::wire` (`buffa` feature) — the `mediatime.v1` package as
+  protobuf reads it, for `extern_path(".mediatime.v1", "::mediatime::wire")`.
+  `wire::Timebase`, `wire::Timestamp` and `wire::TimeRange` are plain wire
+  types that start from protobuf's zero state and keep what they read: a
+  proto3 encoder's `0/3`, written as the denominator alone, reads back as
+  `0/3`, and a range field split over several occurrences merges.
+  `TryFrom<wire::X> for X` is the checked conversion, naming what fails in
+  `wire::ConversionError`; `From<X>` is the total one. The types write
+  proto3's canonical form — a scalar only when it is not zero, a nested
+  timebase only when present — byte for byte what buffa's generated code
+  writes for the same messages, so a decode and re-encode merges as the
+  original does. Each wire type carries buffa's view contracts, so
+  generated code holding a
+  `.mediatime.v1` field compiles under buffa's default view generation — a
+  test compiles buffa-codegen 0.9's output for such a message.
+
+### Changed
+
+- **Breaking:** a `TimeRange`'s endpoints are ordered by construction
+  everywhere. `with_start`, `with_end`, `set_start` and `set_end` are
+  removed: they assigned without checking, so a safe call could build a
+  range whose `end` precedes its `start` — one every other road refuses,
+  and one this version's own `buffa` decoder would not read back. In their
+  place, `try_with_start`/`try_with_end`/`try_set_start`/`try_set_end`
+  answer `Err(InvertedRange)` (a new error type, which serde's refusal now
+  uses too) and leave the range as it was, and `with_bounds`/`set_bounds`
+  move both ends at once, panicking on inverted bounds as `TimeRange::new`
+  does. `TimeRange::duration` no longer has a panic path.
+- **Breaking:** `Timebase`, `Timestamp` and `TimeRange` no longer implement
+  buffa's `Message` or `DefaultInstance`, and the crate root's
+  `__buffa::view` aliases are gone: the `mediatime.v1` package maps onto
+  `::mediatime::wire` (`extern_path(".mediatime.v1", "::mediatime::wire")`),
+  and a generated container holds wire values, converted at the edge with
+  `TryFrom<wire::X> for X` and `From<X> for wire::X`. A domain type has no
+  protobuf zero state, and buffa builds a mapped value without decoding it
+  on several roads — an omitted map value, an unset field's default
+  instance, an element or a message before its merge — so the domain
+  mapping invented values there (an omitted map value read as
+  `Timestamp(0 @ 1/1)`, which a re-encode then wrote out) that no codec of
+  its own could refuse. The wire types hold the zero message on those
+  roads, and the conversion refuses it by name (`MissingTimebase`).
+- `Rate`'s `FromStr` also reads a whole number of events per second:
+  `"25"` is `25/1`, through `Rate::try_hz`. A decimal rate stays refused
+  (`23.976` is not `24000/1001`), and `Timebase`'s door still takes no bare
+  number. `ParseRateError`'s message names the new arm.
+
+### Fixed
+
+- An inverted `TimeRange` no longer comes out of buffa. 0.4.0's decoder
+  admitted one from a peer, after which `duration()` panicked; the domain
+  type now has no decoder at all, and `TryFrom<wire::TimeRange>` refuses an
+  inverted range by name (`InvertedRange`), whether it arrived whole or
+  split over occurrences that `wire` merges as protobuf does.
+- Documentation: a zero `Timebase` numerator stays legal — `0/1` is
+  libavformat's "undeclared" timebase, and every reader accepts what the
+  constructors build — and `Timebase`'s docs now say what every road does
+  with one. `Timestamp::duration` states its answer for a degenerate
+  timebase (zero, for any count).
+
 ## [0.4.0] - 2026-08-27
 
 ### Added

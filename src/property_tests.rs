@@ -592,4 +592,306 @@ quickcheck! {
       None => true,
     }
   }
+
+  /// Naming `Nearest` reproduces the rescale that names no rounding, for every
+  /// input — its refusals and the degenerate target included. This is the pin
+  /// that keeps `checked_rescale` on FFmpeg's rule while the named road is
+  /// built on a different division.
+  fn nearest_is_the_rescale_that_names_no_rounding(pts: i64, from: (u32, u32), to: (u32, u32), coarse: bool) -> bool {
+    let (from, to) = if coarse {
+      (coarse_timebase(from), coarse_timebase(to))
+    } else {
+      (any_timebase(from), any_timebase(to))
+    };
+    from.checked_rescale_with(pts, to, Rounding::Nearest) == from.checked_rescale(pts, to)
+  }
+
+  /// The tie, constructed rather than waited for — an odd count of
+  /// half-second ticks into whole seconds, at both signs — goes where
+  /// `checked_rescale` sends it: away from zero. Random draws reach an exact
+  /// tie too rarely to pin this (measured: a half-up rule passed the
+  /// property above).
+  fn nearest_breaks_ties_where_checked_rescale_does(pts: i64) -> bool {
+    let half_seconds = Timebase::new(1, nz(2));
+    let pts = pts | 1;
+    half_seconds.checked_rescale_with(pts, Timebase::SECONDS, Rounding::Nearest)
+      == half_seconds.checked_rescale(pts, Timebase::SECONDS)
+  }
+
+  /// Floor and ceiling bracket the exact quotient: they are one tick apart
+  /// unless it is whole, and then both are it — and nearest is one of the two.
+  fn floor_and_ceil_bracket_the_exact_quotient(pts: i64, from: (u32, u32), to: (u32, u32)) -> TestResult {
+    let (from, to) = (any_timebase(from), target_timebase(to));
+    let floor = from.checked_rescale_with(pts, to, Rounding::Floor);
+    let ceil = from.checked_rescale_with(pts, to, Rounding::Ceil);
+    let nearest = from.checked_rescale_with(pts, to, Rounding::Nearest);
+    let (Some(f), Some(c), Some(n)) = (floor, ceil, nearest) else {
+      return TestResult::discard();
+    };
+    let (num, den) = exact_quotient(pts, from, to);
+    let whole = num % den == 0;
+    TestResult::from_bool(
+      (f as i128) * den <= num
+        && num <= (c as i128) * den
+        && (c as i128) - (f as i128) == if whole { 0 } else { 1 }
+        && (n == f || n == c),
+    )
+  }
+
+  /// The typed roads are the count-level one under their own names, landing
+  /// in the timebase they were asked for.
+  fn the_typed_directed_rescales_agree_with_the_count(pts: i64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
+    let (from, to) = (any_timebase(from), any_timebase(to));
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
+    let count = from.checked_rescale_with(pts, to, rounding);
+    let instant = Timestamp::new(pts, from).checked_rescale_with(to, rounding);
+    let span = SignedDuration::new(pts, from).checked_rescale_with(to, rounding);
+    instant.map(|t| (t.pts(), t.timebase().is_identical(&to))) == count.map(|q| (q, true))
+      && span.map(|s| (s.ticks(), s.timebase().is_identical(&to))) == count.map(|q| (q, true))
+  }
+
+  /// An unsigned span rescales as the signed road does wherever both can hold
+  /// the answer, and past `i64::MAX` it keeps answering; under `Nearest` it is
+  /// `checked_rescale_to` over the whole `u64` range.
+  fn duration_directed_rescale_is_the_signed_road_with_twice_the_reach(ticks: u64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
+    let (from, to) = (any_timebase(from), any_timebase(to));
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
+    let span = Duration::new(ticks, from);
+    let named = span.checked_rescale_with(to, rounding).map(|d| d.ticks());
+    let nearest_is_the_rung = span.checked_rescale_with(to, Rounding::Nearest) == span.checked_rescale_to(to);
+    let agrees_with_signed = if ticks > i64::MAX as u64 {
+      true
+    } else {
+      match (from.checked_rescale_with(ticks as i64, to, rounding), named) {
+        (Some(q), Some(u)) => q >= 0 && q as u64 == u,
+        (None, Some(u)) => u > i64::MAX as u64,
+        (Some(_), None) => false,
+        (None, None) => true,
+      }
+    };
+    nearest_is_the_rung && agrees_with_signed
+  }
+
+  /// One term read back is the directed rescale of that term: the exact
+  /// seconds of a span, counted in `to` under a rounding, are what
+  /// `checked_rescale_with` answers — so summing first and rounding once
+  /// changes nothing for a sum of one.
+  fn one_term_read_back_is_the_directed_rescale(ticks: i64, from: (u32, u32), to: (u32, u32), which: u8) -> bool {
+    let (from, to) = (any_timebase(from), any_timebase(to));
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
+    let span = SignedDuration::new(ticks, from);
+    ExactSeconds::from_signed_duration(span).checked_to_signed_duration(to, rounding)
+      == span.checked_rescale_with(to, rounding)
+  }
+
+  /// The exact sum commutes, and taking a term back out returns the other —
+  /// for spans in unrelated timebases, where no tick of either holds both.
+  fn the_exact_sum_commutes_and_undoes(a: (i64, u32, u32), b: (i64, u32, u32)) -> bool {
+    let a = ExactSeconds::from_signed_duration(SignedDuration::new(a.0, any_timebase((a.1, a.2))));
+    let b = ExactSeconds::from_signed_duration(SignedDuration::new(b.0, any_timebase((b.1, b.2))));
+    match a.checked_add(b) {
+      Some(sum) => b.checked_add(a) == Some(sum) && sum.checked_sub(b) == Some(a) && sum.checked_sub(a) == Some(b),
+      None => b.checked_add(a).is_none(),
+    }
+  }
+
+  /// Exact seconds order as the spans they came from: `Ord` here is
+  /// `cmp_semantic` there. Small counts in unrelated timebases, so the two
+  /// sit close together and astride zero.
+  fn exact_seconds_order_as_their_spans_do(a: (i8, u32, u32), b: (i8, u32, u32)) -> bool {
+    let a = SignedDuration::new(a.0 as i64, any_timebase((a.1, a.2)));
+    let b = SignedDuration::new(b.0 as i64, any_timebase((b.1, b.2)));
+    ExactSeconds::from_signed_duration(a).cmp(&ExactSeconds::from_signed_duration(b)) == a.cmp_semantic(&b)
+  }
+
+  /// A sum's floor and ceiling bracket it: floor ≤ exact ≤ ceiling, one tick
+  /// apart unless the sum lands on a tick — compared as exact seconds, on
+  /// sums whose denominators run past what a cross-multiply holds.
+  fn floor_and_ceil_bracket_an_exact_sum(a: (i64, u32, u32), b: (i64, u32, u32), to: (u32, u32)) -> TestResult {
+    let a = ExactSeconds::from_signed_duration(SignedDuration::new(a.0, any_timebase((a.1, a.2))));
+    let b = ExactSeconds::from_signed_duration(SignedDuration::new(b.0, any_timebase((b.1, b.2))));
+    let to = target_timebase(to);
+    let Some(sum) = a.checked_add(b) else {
+      return TestResult::discard();
+    };
+    let floor = sum.checked_to_signed_duration(to, Rounding::Floor);
+    let ceil = sum.checked_to_signed_duration(to, Rounding::Ceil);
+    let (Some(f), Some(c)) = (floor, ceil) else {
+      return TestResult::discard();
+    };
+    let (f_s, c_s) = (ExactSeconds::from_signed_duration(f), ExactSeconds::from_signed_duration(c));
+    let on_a_tick = f_s == sum;
+    TestResult::from_bool(
+      f_s <= sum && sum <= c_s && (c.ticks() as i128) - (f.ticks() as i128) == if on_a_tick { 0 } else { 1 },
+    )
+  }
+
+  /// The exact rescale answers exactly when floor and ceiling agree, and then
+  /// it is both; otherwise it refuses. Tiny timebases make whole quotients
+  /// common enough to reach the answering arm.
+  fn exact_answers_when_floor_is_ceil(pts: i64, small: i16, from: (u32, u32), to: (u32, u32), coarse: bool) -> bool {
+    let (pts, from, to) = if coarse {
+      (small as i64, coarse_timebase(from), coarse_timebase(to))
+    } else {
+      (pts, any_timebase(from), any_timebase(to))
+    };
+    let floor = from.checked_rescale_with(pts, to, Rounding::Floor);
+    let ceil = from.checked_rescale_with(pts, to, Rounding::Ceil);
+    let exact = from.checked_rescale_exact(pts, to);
+    match (floor, ceil) {
+      (Some(f), Some(c)) if f == c => exact == Some(f),
+      _ => exact.is_none(),
+    }
+  }
+
+  /// An exact answer is a round trip: rescaling it back is exact too, and
+  /// returns the count it came from.
+  fn an_exact_rescale_round_trips(small: i16, from: (u32, u32), to: (u32, u32)) -> bool {
+    let (pts, from, to) = (small as i64, coarse_timebase(from), coarse_timebase(to));
+    match from.checked_rescale_exact(pts, to) {
+      Some(q) if from.num() != 0 => to.checked_rescale_exact(q, from) == Some(pts),
+      _ => true,
+    }
+  }
+
+  /// The range algebra's own laws, over small endpoints in tiny timebases —
+  /// degenerate ones included — so boundaries coincide often: `overlaps` is
+  /// symmetric, `within` is `contains` read from the other side and is
+  /// `after` the operand's start and `before` its end.
+  fn range_predicates_keep_their_algebra(a: (i8, i8, (u32, u32)), b: (i8, i8, (u32, u32))) -> bool {
+    let range = |(x, y, tb): (i8, i8, (u32, u32))| {
+      TimeRange::new(x.min(y) as i64, x.max(y) as i64, coarse_timebase(tb))
+    };
+    let (a, b) = (range(a), range(b));
+    a.overlaps(&b) == b.overlaps(&a)
+      && a.within(&b) == b.contains(&a)
+      && a.within(&b) == (a.after(&b.start()) && a.before(&b.end()))
+      && a.overlaps(&b) == (a.start() < b.end() && a.end() > b.start())
+      && a.contains(&b) == (a.start() <= b.start() && a.end() >= b.end())
+  }
+
+  /// Every instant is in exactly one place relative to a range: before its
+  /// start, inside it, or at or past its end.
+  fn an_instant_is_before_inside_or_past_a_range(a: (i8, i8, (u32, u32)), t: (i8, (u32, u32))) -> bool {
+    let (x, y, tb) = a;
+    let range = TimeRange::new(x.min(y) as i64, x.max(y) as i64, coarse_timebase(tb));
+    let t = Timestamp::new(t.0 as i64, coarse_timebase(t.1));
+    let not_begun = range.start() > t;
+    let inside = range.contains_instant(&t);
+    let over = range.before(&t);
+    [not_begun, inside, over].iter().filter(|&&held| held).count() == 1
+  }
+
+  /// For two ranges that each span time, overlapping is sharing an instant:
+  /// the later start comes before the earlier end. (A zero-length range is
+  /// where the algebra and "a shared instant" part ways — see the docs.)
+  fn nonempty_ranges_overlap_when_they_share_time(a: (i8, i8, (u32, u32)), b: (i8, i8, (u32, u32))) -> TestResult {
+    let range = |(x, y, tb): (i8, i8, (u32, u32))| {
+      TimeRange::new(x.min(y) as i64, x.max(y) as i64, coarse_timebase(tb))
+    };
+    let (a, b) = (range(a), range(b));
+    if a.start() >= a.end() || b.start() >= b.end() {
+      return TestResult::discard();
+    }
+    let later_start = a.start().max(b.start());
+    let earlier_end = a.end().min(b.end());
+    TestResult::from_bool(a.overlaps(&b) == (later_start < earlier_end))
+  }
+
+  /// Decimal seconds read at a timebase land where the same instant, counted
+  /// in milliseconds, rescales to — under every rounding, refusals included.
+  /// The digits are read exactly; a float in between would miss ties.
+  fn decimal_seconds_read_as_the_milliseconds_they_spell(ms: i32, to: (u32, u32), which: u8) -> bool {
+    let to = target_timebase(to);
+    let rounding = [
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+      Rounding::Exact,
+    ][which as usize % 4];
+    let magnitude = ms.unsigned_abs();
+    let sign = if ms < 0 { "-" } else { "" };
+    let text = format!("{sign}{}.{:03}", magnitude / 1000, magnitude % 1000);
+    Timestamp::parse_seconds(&text, to, rounding).ok()
+      == Timestamp::new(ms as i64, Timebase::MILLIS).checked_rescale_with(to, rounding)
+  }
+
+  /// A whole number parses as that many events per second, or is refused
+  /// exactly where `Rate::try_hz` refuses it.
+  fn a_whole_number_parses_as_that_many_events_per_second(n: i32) -> bool {
+    n.to_string().parse::<Rate>().ok() == Rate::try_hz(n)
+  }
+
+  /// The float reading keeps the rate's order and its equality: correct
+  /// rounding is monotone, so a faster rate never reads slower, and equal
+  /// rates — however written — read the same double.
+  fn a_rates_float_keeps_its_order(a: (u32, u32), b: (u32, u32)) -> bool {
+    let (a, b) = (any_timebase(a), any_timebase(b));
+    let (a, b) = (Rate::fps(a.num(), a.den()), Rate::fps(b.num(), b.den()));
+    match a.cmp(&b) {
+      Ordering::Less => a.as_f64() <= b.as_f64(),
+      Ordering::Equal => a.as_f64() == b.as_f64(),
+      Ordering::Greater => a.as_f64() >= b.as_f64(),
+    }
+  }
+
+  /// A sum reads back whenever its count fits: if the exact seconds lie
+  /// between `i64::MIN` and `i64::MAX` ticks of the target, every rounding
+  /// but `Exact` answers — and its answer brackets the sum as the rounding
+  /// says — however large the sum's denominator has grown.
+  fn an_exact_sum_reads_back_whenever_its_count_fits(a: (i16, u32), b: (i16, u32), c: (i16, u32), d: (i16, u32), to: (u32, u32)) -> TestResult {
+    // Small counts over `1/den` timebases: the sum stays small while its
+    // denominator grows toward the product of four 31-bit denominators —
+    // past where a target's numerator times it fits an `i128`.
+    let term = |(ticks, den): (i16, u32)| {
+      let den = (den % (i32::MAX as u32)) as i32 + 1;
+      ExactSeconds::from_signed_duration(SignedDuration::new(ticks as i64, Timebase::new(1, nz(den))))
+    };
+    let Some(sum) = term(a)
+      .checked_add(term(b))
+      .and_then(|s| s.checked_add(term(c)))
+      .and_then(|s| s.checked_add(term(d)))
+    else {
+      return TestResult::discard();
+    };
+    let to = target_timebase(to);
+    let lowest = ExactSeconds::from_signed_duration(SignedDuration::new(i64::MIN, to));
+    let highest = ExactSeconds::from_signed_duration(SignedDuration::new(i64::MAX, to));
+    if sum < lowest || sum > highest {
+      return TestResult::discard();
+    }
+    let read = |rounding| sum.checked_to_signed_duration(to, rounding);
+    let (Some(f), Some(c), Some(n)) = (read(Rounding::Floor), read(Rounding::Ceil), read(Rounding::Nearest)) else {
+      return TestResult::failed();
+    };
+    let (f_s, c_s) = (ExactSeconds::from_signed_duration(f), ExactSeconds::from_signed_duration(c));
+    TestResult::from_bool(
+      f_s <= sum
+        && sum <= c_s
+        && (c.ticks() as i128) - (f.ticks() as i128) == if f_s == sum { 0 } else { 1 }
+        && (n == f || n == c),
+    )
+  }
+
+  /// `duration` is the span `duration_since` measures between the ends, for
+  /// every range there is: it drops only the refusal no range can reach.
+  fn a_ranges_duration_is_the_span_between_its_ends(a: i64, b: i64, tb: (u32, u32)) -> bool {
+    let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
+    Some(range.duration()) == range.end().duration_since(&range.start())
+  }
 }

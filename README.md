@@ -47,12 +47,14 @@ mediatime::Timestamp:     100 ms    == 9000 ticks @ 1/90000 → true
 - **Value-based equality and ordering on the instants and the rationals.** `1/2 == 2/4 == 3/6`; `Timestamp(1000, 1/1000) == Timestamp(90_000, 1/90_000)`. Cross-timebase `cmp` uses 128-bit cross-multiply — exact for any `i32` numerator/denominator with any `i64` PTS. Spans and ranges are compared as written instead, and carry no `Ord` at all; each type's docs say which it is and why.
 - **Hash agrees with Eq.** Hashes the reduced-form rational, so equal rationals hash identically and you can use these types as `HashMap` keys.
 - **FFmpeg-style utilities.** `checked_rescale` / `saturating_rescale` (a.k.a. `av_rescale_q`, rounding to nearest with halfway cases away from zero, as FFmpeg's `AV_ROUND_NEAR_INF` does), `checked_duration_to_pts` / `checked_pts_to_duration`, `duration_since`, `saturating_sub_duration`. Every lossy conversion is spelled `checked_` or `saturating_` — there is no bare name whose overflow posture you have to remember.
-- **Rates are their own type.** `Rate` is a timebase read the other way round — events per second rather than seconds per tick — so a frame rate cannot reach `av_rescale_q` as a timebase by accident. It knows how long *n* frames take (`checked_frames_to_duration`), carries its own roster (`Rate::FPS_29_97`, `FPS_23_976`, …), and converts both ways with `to_timebase` / `from_timebase`. Its eight rates are `Timebase`'s eight frame intervals reciprocated, entry for entry — a test pins the bijection, so neither roster can grow a frame rate without the other.
+- **Directed rounding and exact sums.** `Rounding` names which way a value between two ticks goes — `Nearest` (FFmpeg's rule, and every unnamed rescale's), `Floor`, `Ceil`, or `Exact` (refuse) — on `checked_rescale_with` for every type and `checked_rescale_exact` for a bare count, so a trim can land its start up and its end down. `ExactSeconds` sums instants and spans across timebases with no rounding at all, and is read back once, by the rounding you name: a running total never drifts by half a tick per term.
+- **Where a range sits.** `TimeRange` answers `contains_instant`, `contains`, `overlaps`, `within`, `before` and `after` against ranges and instants in any timebase, exactly — the same algebra as ingraph's span filter, with every degenerate case (an instant at either end, abutting ranges, zero-length ranges) written down.
+- **Rates are their own type.** `Rate` is a timebase read the other way round — events per second rather than seconds per tick — so a frame rate cannot reach `av_rescale_q` as a timebase by accident. It knows how long *n* frames take (`checked_frames_to_duration`), reads as the nearest `f64` where a float is needed (`as_f64`), carries its own roster (`Rate::FPS_29_97`, `FPS_23_976`, …), and converts both ways with `to_timebase` / `from_timebase`. Its eight rates are `Timebase`'s eight frame intervals reciprocated, entry for entry — a test pins the bijection, so neither roster can grow a frame rate without the other.
 - **Signed spans, and their unsigned counterpart.** `SignedDuration` is what the difference of two instants actually is — `later.signed_duration_since(&earlier)` — and `core::time::Duration` cannot hold it, being unsigned. It shifts an instant back again (`ts.checked_add_signed(span)`, `saturating_sub_signed`), adds and subtracts across timebases, and answers in the left operand's. Sorting by length is asked for by name — `spans.sort_by(SignedDuration::cmp_semantic)` — because `2 @ 1/1` and `1000 @ 1/1000` are one second apart in length and the counts say the opposite. `Duration` is the same shape with the sign dropped — `{ ticks: u64, timebase }` — for a length that is never negative to begin with; it converts both ways with `core::time::Duration` (`checked_from_std` / `checked_to_std`, twice `checked_duration_to_pts`'s `i64` reach) and with `SignedDuration` (`checked_from_signed` / `checked_to_signed`).
 - **Named timebases.** Twenty-seven in three families: the clock subdivisions (`SECONDS`, `MILLIS`, `MICROS`, `NANOS`, `MPEG_90K`), fourteen audio sample intervals (`HZ_8K` … `HZ_192K`), and eight frame intervals (`NTSC_FILM`, `FILM_24`, `PAL_25`, `NTSC_VIDEO`, `VIDEO_30`, `PAL_50`, `NTSC_60`, `VIDEO_60`) — each with the container or codec convention that declares it. `Timebase::from_name("MPEG_90K")` reads a name — in any ASCII case, so `"mpeg_90k"` reads too — `well_known_name()` writes the canonical spelling back, and `FromStr` accepts either a name or `num/den`. One value, one name: the roster holds the values a convention travels with, so Matroska's and FLV's millisecond bases are both `MILLIS` with no alias beside it, while an MP4/MOV timescale — chosen per file by the muxer — carries no convention to name and stays the rational it is.
 - **`TimeRange` interpolation.** Linear midpoint (`interpolate(t)`) for placing an event somewhere between fade-out and fade-in frames, with `t ∈ [0, 1]` clamped.
 - **`Display` for logs.** `{}` is readable where there is a readable form — `0:00:00.137`, `[0:00:01.500, 0:00:03.250)` — and `{:#}` is exact: `12345 @ 1/90000`, `[1500, 3250) @ 1/1000`. A rational, a rate and a span have nothing to expand into, so their one rendering is exact in both: `1/1000`, `30000/1001`, `-1500 @ 1/1000`.
-- **`FromStr` for the exact form.** All six types read back the value that wrote them, each rejecting with its own error. The readable clock has no inverse — it is truncated to milliseconds and names no timebase — so it is rejected rather than guessed at. Roster names read on the input side only, and only on their own door: `"MILLIS"` is a timebase, `"FPS_24"` is a rate, and neither parses as the other, a rate being the reciprocal reading of a rational rather than a second spelling of it.
+- **`FromStr` for the exact form.** All six types read back the value that wrote them, each rejecting with its own error. The readable clock has no inverse — it is truncated to milliseconds and names no timebase — so it is rejected rather than guessed at. Roster names read on the input side only, and only on their own door: `"MILLIS"` is a timebase, `"FPS_24"` is a rate, and neither parses as the other, a rate being the reciprocal reading of a rational rather than a second spelling of it. A rate also reads as a bare whole number (`"25"`), and `Timestamp::parse_seconds` reads decimal seconds a person wrote — exactly, with no float in between — at the timebase and rounding you name.
 - **`no_std` + `no_alloc` library.** The library builds without `std` and `alloc`; tests use `std`.
 - **`const fn` throughout.** Build `Timebase` / `Timestamp` / `TimeRange` in `const` context.
 
@@ -61,7 +63,7 @@ mediatime::Timestamp:     100 ms    == 9000 ticks @ 1/90000 → true
 ```rust
 use core::num::NonZeroI32;
 use core::time::Duration;
-use mediatime::{Rate, Timebase, Timestamp, TimeRange};
+use mediatime::{ExactSeconds, Rate, Rounding, SignedDuration, Timebase, Timestamp, TimeRange};
 
 // FFmpeg-style rational timebases — spelled out, or taken from the roster.
 let ms     = Timebase::new(1, NonZeroI32::new(1000).unwrap());
@@ -120,6 +122,30 @@ assert_eq!("45000 @ 1/90000".parse(), Ok(span));
 // Each roster stays on its own door: a rate is not a timebase.
 assert!("MILLIS".parse::<Rate>().is_err());
 assert!("FPS_29_97".parse::<Timebase>().is_err());
+
+// Directed rounding: a trim's start lands on the frame at or after it.
+let start = Timestamp::new(100, ms).checked_rescale_with(Timebase::NTSC_VIDEO, Rounding::Ceil);
+assert_eq!(start.map(|t| t.pts()), Some(3)); // 100 ms is 2.997 frames
+
+// An exact sum across timebases, read back once: 1001 ms plus one NTSC
+// frame is exactly 31 frames, and no whole number of milliseconds.
+let total = ExactSeconds::from_signed_duration(SignedDuration::new(1001, ms))
+  .checked_add(ExactSeconds::from_signed_duration(SignedDuration::new(1, Timebase::NTSC_VIDEO)))
+  .unwrap();
+let frames = total.checked_to_signed_duration(Timebase::NTSC_VIDEO, Rounding::Exact);
+assert_eq!(frames.map(|s| s.ticks()), Some(31));
+assert_eq!(total.checked_to_signed_duration(ms, Rounding::Exact), None);
+
+// Ranges answer where they sit, in any timebase: [100 ms, 500 ms) holds its
+// start but not its end, and abuts [0.5 s, 1 s) without overlapping it.
+assert!(r.contains_instant(&Timestamp::new(9_000, mpegts)));
+assert!(!r.contains_instant(&Timestamp::new(500, ms)));
+assert!(!r.overlaps(&TimeRange::new(45_000, 90_000, mpegts)));
+assert!(r.overlaps(&TimeRange::new(9_000, 90_000, mpegts)));
+
+// Decimal seconds read exactly, and a rate as a whole number.
+assert_eq!(Timestamp::parse_seconds("0.25", ms, Rounding::Exact), Ok(Timestamp::new(250, ms)));
+assert_eq!("25".parse::<Rate>(), Ok(Rate::FPS_25));
 ```
 
 ## Installation

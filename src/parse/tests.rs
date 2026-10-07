@@ -489,15 +489,19 @@ fn rate_parse_rejects_what_the_constructor_rejects() {
 fn rate_parse_rejects_malformed_input() {
   for s in [
     "",
-    "24",
     "/24",
     "24/",
     "24/1/1",
     "a/b",
     "23.976",
+    "24.0",
+    "-24",
+    "24 fps",
+    "0x18",
     "24/1 fps",
     "FPS24",
     "fps_23_97",
+    "2147483648",
     "2147483648/1",
     "1/2147483648",
   ] {
@@ -539,10 +543,217 @@ fn parse_errors_name_the_grammar_they_wanted() {
   );
   assert_eq!(
     message(&ParseRateError(())),
-    "expected a rate `num/den` with num >= 0 and den > 0, or a well-known rate name"
+    "expected a rate `num/den` with num >= 0 and den > 0, a whole number >= 0, or a well-known rate name"
   );
   assert_eq!(
     message(&ParseTimeRangeError(())),
     "expected a time range `[start, end) @ num/den`, with start <= end"
   );
+}
+
+#[test]
+fn rate_parses_a_whole_number_of_events_per_second() {
+  for (s, n) in [("25", 25), (" 48000 ", 48_000), ("+24", 24), ("0", 0)] {
+    let rate: Rate = s.parse().expect(s);
+    assert_same_fields(&rate, &Rate::hz(n));
+    assert_eq!(rate.den().get(), 1);
+  }
+  assert_eq!("25".parse::<Rate>(), Ok(Rate::FPS_25));
+  // `Display` still writes the rational, which parses back to the same rate.
+  assert_eq!(format!("{}", "25".parse::<Rate>().unwrap()), "25/1");
+  // The timebase door keeps refusing a bare number: it would read as a rate.
+  assert_eq!("1000".parse::<Timebase>(), Err(ParseTimebaseError(())));
+}
+
+#[test]
+fn parse_seconds_reads_decimal_seconds_exactly() {
+  let ms = Timebase::MILLIS;
+  for (text, timebase, pts) in [
+    ("1.5", ms, 1500),
+    ("-0.040", ms, -40),
+    ("+3", Timebase::SECONDS, 3),
+    ("  2.000  ", ms, 2000),
+    ("007.50", ms, 7500),
+    ("0", ms, 0),
+    ("-0", ms, 0),
+    ("0.1", Timebase::NANOS, 100_000_000),
+    ("1.001", Timebase::NTSC_VIDEO, 30),
+    ("-1.001", Timebase::NTSC_VIDEO, -30),
+  ] {
+    for rounding in [
+      Rounding::Exact,
+      Rounding::Nearest,
+      Rounding::Floor,
+      Rounding::Ceil,
+    ] {
+      assert_eq!(
+        Timestamp::parse_seconds(text, timebase, rounding),
+        Ok(Timestamp::new(pts, timebase)),
+        "{text:?} under {rounding:?}"
+      );
+    }
+  }
+  // Trailing zeros change nothing, however many there are.
+  let long_one = format!("1.{}", "0".repeat(60));
+  assert_eq!(
+    Timestamp::parse_seconds(&long_one, ms, Rounding::Exact),
+    Ok(Timestamp::new(1000, ms))
+  );
+}
+
+#[test]
+fn parse_seconds_rounds_the_way_it_is_told() {
+  let ms = Timebase::MILLIS;
+  // Half a millisecond either side of zero: the tie goes away from zero
+  // under `Nearest`, and floor and ceiling keep their direction.
+  for (text, floor, ceil, nearest) in [("0.0005", 0, 1, 1), ("-0.0005", -1, 0, -1)] {
+    let read = |rounding| Timestamp::parse_seconds(text, ms, rounding).map(|t| t.pts());
+    assert_eq!(read(Rounding::Floor), Ok(floor), "{text}");
+    assert_eq!(read(Rounding::Ceil), Ok(ceil), "{text}");
+    assert_eq!(read(Rounding::Nearest), Ok(nearest), "{text}");
+    assert_eq!(
+      read(Rounding::Exact),
+      Err(ParseSecondsError::BetweenTicks),
+      "{text}"
+    );
+  }
+  // One second at 29.97 fps is 29.97 frames.
+  let ntsc = Timebase::NTSC_VIDEO;
+  let read = |rounding| Timestamp::parse_seconds("1", ntsc, rounding).map(|t| t.pts());
+  assert_eq!(read(Rounding::Floor), Ok(29));
+  assert_eq!(read(Rounding::Ceil), Ok(30));
+  assert_eq!(read(Rounding::Nearest), Ok(30));
+  assert_eq!(read(Rounding::Exact), Err(ParseSecondsError::BetweenTicks));
+}
+
+#[test]
+fn parse_seconds_refuses_by_name() {
+  let ms = Timebase::MILLIS;
+  for text in [
+    "",
+    " ",
+    "+",
+    "-",
+    ".",
+    ".5",
+    "5.",
+    "1e3",
+    "1E3",
+    "1_000",
+    "inf",
+    "NaN",
+    "1.2.3",
+    "--1",
+    "+-1",
+    "1 .5",
+    "1. 5",
+    "0:00:01.000",
+    "1s",
+    "0x10",
+    "١",
+  ] {
+    assert_eq!(
+      Timestamp::parse_seconds(text, ms, Rounding::Nearest),
+      Err(ParseSecondsError::NotDecimal),
+      "{text:?}"
+    );
+  }
+
+  let zero = Timebase::new(0, nz(1));
+  assert_eq!(
+    Timestamp::parse_seconds("1", zero, Rounding::Nearest),
+    Err(ParseSecondsError::DegenerateTimebase)
+  );
+  assert_eq!(
+    Timestamp::parse_seconds("0", zero, Rounding::Exact),
+    Err(ParseSecondsError::DegenerateTimebase)
+  );
+  // The text is judged first.
+  assert_eq!(
+    Timestamp::parse_seconds("x", zero, Rounding::Nearest),
+    Err(ParseSecondsError::NotDecimal)
+  );
+
+  // Past i64 in the timebase, whether or not the count is whole, and past
+  // what an exact i128 reading holds.
+  assert_eq!(
+    Timestamp::parse_seconds("9223372036854775808", Timebase::SECONDS, Rounding::Exact),
+    Err(ParseSecondsError::OutOfRange)
+  );
+  assert_eq!(
+    Timestamp::parse_seconds("9223372036854775807.5", Timebase::SECONDS, Rounding::Ceil),
+    Err(ParseSecondsError::OutOfRange)
+  );
+  assert_eq!(
+    Timestamp::parse_seconds("9223372036854775807", Timebase::SECONDS, Rounding::Exact),
+    Ok(Timestamp::new(i64::MAX, Timebase::SECONDS))
+  );
+  let too_many_digits = format!("1{}", "0".repeat(39));
+  assert_eq!(
+    Timestamp::parse_seconds(&too_many_digits, ms, Rounding::Floor),
+    Err(ParseSecondsError::OutOfRange)
+  );
+  let too_fine = format!("0.{}1", "0".repeat(38));
+  assert_eq!(
+    Timestamp::parse_seconds(&too_fine, ms, Rounding::Floor),
+    Err(ParseSecondsError::OutOfRange)
+  );
+}
+
+#[test]
+fn parse_seconds_errors_say_what_failed() {
+  fn message(e: &dyn core::error::Error) -> String {
+    format!("{e}")
+  }
+  assert_eq!(
+    message(&ParseSecondsError::NotDecimal),
+    "expected decimal seconds: an optional sign, digits, and optionally a point and digits"
+  );
+  assert_eq!(
+    message(&ParseSecondsError::BetweenTicks),
+    "the seconds fall between two ticks of the timebase, and an exact reading was asked for"
+  );
+  assert_eq!(
+    message(&ParseSecondsError::OutOfRange),
+    "the seconds are out of range for a count of the timebase's ticks"
+  );
+  assert_eq!(
+    message(&ParseSecondsError::DegenerateTimebase),
+    "the timebase's numerator is zero, so no count of its ticks measures seconds"
+  );
+}
+
+#[test]
+fn parse_seconds_names_between_ticks_only_inside_the_range() {
+  let seconds = Timebase::SECONDS;
+  let read = |text, rounding| Timestamp::parse_seconds(text, seconds, rounding).map(|t| t.pts());
+
+  // Half a second past either end of `i64`: the instant is out of range,
+  // though one of its two ticks is not.
+  for text in ["9223372036854775807.5", "-9223372036854775808.5"] {
+    assert_eq!(
+      read(text, Rounding::Exact),
+      Err(ParseSecondsError::OutOfRange),
+      "{text}"
+    );
+  }
+  assert_eq!(read("9223372036854775807.5", Rounding::Floor), Ok(i64::MAX));
+  assert_eq!(
+    read("9223372036854775807.5", Rounding::Ceil),
+    Err(ParseSecondsError::OutOfRange)
+  );
+  assert_eq!(read("-9223372036854775808.5", Rounding::Ceil), Ok(i64::MIN));
+  assert_eq!(
+    read("-9223372036854775808.5", Rounding::Floor),
+    Err(ParseSecondsError::OutOfRange)
+  );
+
+  // Half a second inside either end: between two ticks it counts.
+  for text in ["9223372036854775806.5", "-9223372036854775807.5"] {
+    assert_eq!(
+      read(text, Rounding::Exact),
+      Err(ParseSecondsError::BetweenTicks),
+      "{text}"
+    );
+  }
 }

@@ -48,6 +48,10 @@ buffa = { version = "0.9", default-features = false, optional = true }
 criterion = "0.8"
 quickcheck = "1"
 arbitrary = "1"
+# Generates, from a descriptor built in the test, the code a crate mapping
+# `.mediatime.v1` onto `::mediatime::wire` compiles against, so a test can
+# hold that code to what the generator writes today (`tests/wire_codegen.rs`).
+buffa-codegen = "0.9"
 
 [profile.bench]
 opt-level = 3
