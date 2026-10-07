@@ -46,13 +46,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Rounding::Exact`.
 - `Rate::as_f64` — the double nearest a rate, for the places that need a
   float; lossy, and documented as such.
-- `mediatime::wire` (`buffa` feature) — the `mediatime.v1` package as the
-  wire carries it, for `extern_path(".mediatime.v1", "::mediatime::wire")`.
-  `wire::TimeRange` is a range field exactly as merged, with protobuf's
-  merge semantics and no order between its endpoints, so a field split over
-  several occurrences decodes; `TryFrom<wire::TimeRange> for TimeRange`
-  (`wire::InvertedRange`) is the checked conversion, `From<TimeRange>` the
-  total one. `wire::Timebase` and `wire::Timestamp` are the domain types.
+- `mediatime::wire` (`buffa` feature) — the `mediatime.v1` package as
+  protobuf reads it, for `extern_path(".mediatime.v1", "::mediatime::wire")`.
+  `wire::Timebase`, `wire::Timestamp` and `wire::TimeRange` are plain wire
+  types that start from protobuf's zero state and keep what they read: a
+  proto3 encoder's `0/3`, written as the denominator alone, reads back as
+  `0/3`, and a range field split over several occurrences merges.
+  `TryFrom<wire::X> for X` is the checked conversion, naming what fails in
+  `wire::ConversionError`; `From<X>` is the total one. Each wire type
+  carries buffa's view contracts, so generated code holding a
+  `.mediatime.v1` field compiles under buffa's default view generation — a
+  test compiles buffa-codegen 0.9's output for such a message.
 
 ### Changed
 
