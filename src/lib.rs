@@ -2473,28 +2473,6 @@ impl TimeRange {
     }
   }
 
-  /// Bypass-invariant constructor used only by the `buffa` decode path.
-  ///
-  /// During protobuf field-by-field merging, intermediate states may
-  /// temporarily violate `start <= end` (e.g. `start` field arrives before
-  /// `end`, so the partially-decoded struct holds `start=100, end=0`).
-  /// The normal `new()` constructor panics in that case. This constructor
-  /// skips the assertion so decode can proceed.
-  ///
-  /// The *final* value is judged once the whole message is merged: the
-  /// decoder's `merge_to_limit` and `merge_group` refuse a range whose `end`
-  /// precedes its `start` and restore the value they merged into (see
-  /// `buffa.rs`), so a foreign or hostile peer cannot hand one out.
-  #[cfg(feature = "buffa")]
-  #[inline(always)]
-  pub(crate) const fn new_for_decode(start: i64, end: i64, timebase: Timebase) -> Self {
-    Self {
-      start,
-      end,
-      timebase,
-    }
-  }
-
   /// Fallible variant of [`Self::new`]: returns `None` if `end < start`
   /// instead of panicking. Accepts `start == end` (degenerate instant range).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -3744,6 +3722,10 @@ mod arbitrary_impl_tests;
 
 #[cfg(feature = "buffa")]
 mod buffa;
+
+#[cfg(feature = "buffa")]
+#[cfg_attr(docsrs, doc(cfg(feature = "buffa")))]
+pub mod wire;
 
 /// Ancillary module the buffa code generator looks for when an extern-mapped
 /// type is used as a message field with view generation enabled. The mediatime

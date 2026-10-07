@@ -16,7 +16,10 @@
 //! is the honest repair, and admitting it would hand out a range whose
 //! [`duration`](TimeRange::duration) panics. The refusal is judged once the
 //! whole message is in, because a peer may send `start` first and pass
-//! through an inverted state on the way to a valid one.
+//! through an inverted state on the way to a valid one — the whole message as
+//! far as this impl can see, which for a field split over several occurrences
+//! of an enclosing message is one occurrence. [`crate::wire`] is the mapping
+//! that keeps protobuf's merge semantics for that case.
 //!
 //! `Timebase`'s fields were `uint32` before the type became signed. Protobuf's
 //! `int32` and `uint32` are the same plain (non-ZigZag) varint for values a
@@ -35,7 +38,7 @@ use ::buffa::{
   },
 };
 
-use crate::{DEN_ONE, TimeRange, Timebase, Timestamp};
+use crate::{DEN_ONE, TimeRange, Timebase, Timestamp, wire};
 
 const VARINT: u8 = WireType::Varint as u8;
 const LEN: u8 = WireType::LengthDelimited as u8;
@@ -121,6 +124,16 @@ impl Message for Timebase {
 // TimeRange — { int64 start = 1; int64 end = 2; Timebase timebase = 3; }
 // ----------------------------------------------------------------------------
 
+/// The reason an inverted range is refused with, as [`DecodeError::Custom`]
+/// carries it.
+const INVERTED_RANGE: &str = "time range end precedes its start";
+
+/// The wire range `merged` as the domain range, or the refusal an inverted
+/// one gets — the one judgment every decode road below ends in.
+fn judged(merged: wire::TimeRange) -> Result<TimeRange, DecodeError> {
+  TimeRange::try_from(merged).map_err(|_| DecodeError::Custom(INVERTED_RANGE))
+}
+
 impl DefaultInstance for TimeRange {
   fn default_instance() -> &'static Self {
     static VALUE: buffa::__private::OnceBox<TimeRange> = buffa::__private::OnceBox::new();
@@ -128,166 +141,53 @@ impl DefaultInstance for TimeRange {
   }
 }
 
-/// The reason an inverted range is refused with, as
-/// [`DecodeError::Custom`] carries it.
-const INVERTED_RANGE: &str = "time range end precedes its start";
-
-/// `Message::merge_to_limit`'s own loop, as a function the override can judge
-/// the result of.
-fn merge_range_to_limit(
-  range: &mut TimeRange,
-  buf: &mut impl Buf,
-  ctx: DecodeContext<'_>,
-  limit: usize,
-) -> Result<(), DecodeError> {
-  while buf.remaining() > limit {
-    let tag = Tag::decode(buf)?;
-    range.merge_field(tag, buf, ctx)?;
-  }
-  Ok(())
-}
-
-/// `Message::merge_group`'s own loop, likewise: fields up to the `EndGroup`
-/// tag that closes `field_number`, one recursion level down.
-fn merge_range_group(
-  range: &mut TimeRange,
-  buf: &mut impl Buf,
-  ctx: DecodeContext<'_>,
-  field_number: u32,
-) -> Result<(), DecodeError> {
-  let ctx = ctx.descend()?;
-  loop {
-    if !buf.has_remaining() {
-      return Err(DecodeError::UnexpectedEof);
-    }
-    let tag = Tag::decode(buf)?;
-    if tag.wire_type() == WireType::EndGroup {
-      return if tag.field_number() == field_number {
-        Ok(())
-      } else {
-        Err(DecodeError::InvalidEndGroup(tag.field_number()))
-      };
-    }
-    range.merge_field(tag, buf, ctx)?;
-  }
-}
-
-/// Judges a finished merge: one that left the endpoints inverted is refused,
-/// and a merge that fails for any reason leaves `range` as it was before it
-/// began — so no road out of the decoder holds an inverted range, a failed
-/// partial merge included.
-fn settle_range(
-  range: &mut TimeRange,
-  before: TimeRange,
-  merged: Result<(), DecodeError>,
-) -> Result<(), DecodeError> {
-  let judged = match merged {
-    Ok(()) if range.start_pts() > range.end_pts() => Err(DecodeError::Custom(INVERTED_RANGE)),
-    other => other,
-  };
-  if judged.is_err() {
-    *range = before;
-  }
-  judged
-}
-
+/// The domain range's own codec: [`wire::TimeRange`]'s encoding, and its
+/// decoding judged.
+///
+/// Every decode road merges into a [`wire::TimeRange`] seeded from `self` —
+/// which may pass through an inverted state, `start` arriving before `end` —
+/// and assigns back only once the merge is done and the result is ordered.
+/// So a merge that fails, for any reason, leaves `self` as it was, and no
+/// road out of here holds an inverted range.
+///
+/// "Done" is as far as this impl can see: the end of one message, or of one
+/// occurrence of it inside an enclosing message. A field split over several
+/// occurrences is judged at each, so a split whose first part is inverted is
+/// refused here; [`wire`] is the mapping that keeps protobuf's merge semantics
+/// and leaves the judgment to the caller.
 impl Message for TimeRange {
   fn compute_size(&self, cache: &mut SizeCache) -> u32 {
-    let mut size = 0u32;
-    // proto3 zero-elision: sound here — the decoder seeds start/end/pts at 0.
-    if self.start_pts() != 0 {
-      size += 1 + int64_encoded_len(self.start_pts()) as u32;
-    }
-    // proto3 zero-elision: sound here — the decoder seeds start/end/pts at 0.
-    if self.end_pts() != 0 {
-      size += 1 + int64_encoded_len(self.end_pts()) as u32;
-    }
-    // timebase (field 3) — always encoded for unconditional round-trip.
-    let slot = cache.reserve();
-    let inner = self.timebase().compute_size(cache);
-    cache.set(slot, inner);
-    size += 1 + varint_len(inner as u64) as u32 + inner;
-    size
+    wire::TimeRange::from(*self).compute_size(cache)
   }
 
   fn write_to(&self, cache: &mut SizeCache, buf: &mut impl EncodeSink) {
-    // proto3 zero-elision: sound here — the decoder seeds start/end/pts at 0.
-    if self.start_pts() != 0 {
-      Tag::new(1, WireType::Varint).encode(buf);
-      encode_int64(self.start_pts(), buf);
-    }
-    // proto3 zero-elision: sound here — the decoder seeds start/end/pts at 0.
-    if self.end_pts() != 0 {
-      Tag::new(2, WireType::Varint).encode(buf);
-      encode_int64(self.end_pts(), buf);
-    }
-    Tag::new(3, WireType::LengthDelimited).encode(buf);
-    encode_varint(cache.consume_next() as u64, buf);
-    self.timebase().write_to(cache, buf);
+    wire::TimeRange::from(*self).write_to(cache, buf);
   }
 
+  // A field merged on its own — the loops below never call this — is judged
+  // as it lands.
   fn merge_field(
     &mut self,
     tag: Tag,
     buf: &mut impl Buf,
     ctx: DecodeContext<'_>,
   ) -> Result<(), DecodeError> {
-    match tag.field_number() {
-      1 => {
-        if tag.wire_type() != WireType::Varint {
-          return Err(DecodeError::WireTypeMismatch {
-            field_number: 1,
-            expected: VARINT,
-            actual: tag.wire_type() as u8,
-          });
-        }
-        let v = decode_int64(buf)?;
-        // Use the bypass constructor: intermediate state may have
-        // start > end if `start` field arrives before `end`.
-        *self = TimeRange::new_for_decode(v, self.end_pts(), self.timebase());
-      }
-      2 => {
-        if tag.wire_type() != WireType::Varint {
-          return Err(DecodeError::WireTypeMismatch {
-            field_number: 2,
-            expected: VARINT,
-            actual: tag.wire_type() as u8,
-          });
-        }
-        let v = decode_int64(buf)?;
-        // Use the bypass constructor: intermediate state may have
-        // start > end if `end` field arrives before `start`.
-        *self = TimeRange::new_for_decode(self.start_pts(), v, self.timebase());
-      }
-      3 => {
-        if tag.wire_type() != WireType::LengthDelimited {
-          return Err(DecodeError::WireTypeMismatch {
-            field_number: 3,
-            expected: LEN,
-            actual: tag.wire_type() as u8,
-          });
-        }
-        let mut tb = self.timebase();
-        buffa::Message::merge_length_delimited(&mut tb, buf, ctx)?;
-        *self = TimeRange::new_for_decode(self.start_pts(), self.end_pts(), tb);
-      }
-      _ => skip_field_depth(tag, buf, ctx.depth())?,
-    }
+    let mut merged = wire::TimeRange::from(*self);
+    merged.merge_field(tag, buf, ctx)?;
+    *self = judged(merged)?;
     Ok(())
   }
 
-  // Every decode road ends in one of these two loops — `decode`, `merge` and
-  // the length-delimited forms in `merge_to_limit`, a group-encoded field in
-  // `merge_group` — so judging the endpoints here judges every road.
   fn merge_to_limit(
     &mut self,
     buf: &mut impl Buf,
     ctx: DecodeContext<'_>,
     limit: usize,
   ) -> Result<(), DecodeError> {
-    let before = *self;
-    let merged = merge_range_to_limit(self, buf, ctx, limit);
-    settle_range(self, before, merged)
+    let mut merged = wire::TimeRange::from(*self);
+    merged.merge_to_limit(buf, ctx, limit)?;
+    *self = judged(merged)?;
+    Ok(())
   }
 
   fn merge_group(
@@ -296,9 +196,10 @@ impl Message for TimeRange {
     ctx: DecodeContext<'_>,
     field_number: u32,
   ) -> Result<(), DecodeError> {
-    let before = *self;
-    let merged = merge_range_group(self, buf, ctx, field_number);
-    settle_range(self, before, merged)
+    let mut merged = wire::TimeRange::from(*self);
+    merged.merge_group(buf, ctx, field_number)?;
+    *self = judged(merged)?;
+    Ok(())
   }
 
   fn clear(&mut self) {
