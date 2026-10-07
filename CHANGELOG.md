@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.4.1]
+## [0.5.0]
 
 ### Added
 
@@ -60,6 +60,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking:** a `TimeRange`'s endpoints are ordered by construction
+  everywhere. `with_start`, `with_end`, `set_start` and `set_end` are
+  removed: they assigned without checking, so a safe call could build a
+  range whose `end` precedes its `start` — one every other road refuses,
+  and one this version's own `buffa` decoder would not read back. In their
+  place, `try_with_start`/`try_with_end`/`try_set_start`/`try_set_end`
+  answer `Err(InvertedRange)` (a new error type, which serde's refusal now
+  uses too) and leave the range as it was, and `with_bounds`/`set_bounds`
+  move both ends at once, panicking on inverted bounds as `TimeRange::new`
+  does. `TimeRange::duration` no longer has a panic path.
 - `Rate`'s `FromStr` also reads a whole number of events per second:
   `"25"` is `25/1`, through `Rate::try_hz`. A decimal rate stays refused
   (`23.976` is not `24000/1001`), and `Timebase`'s door still takes no bare
@@ -81,9 +91,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   libavformat's "undeclared" timebase, and every reader accepts what the
   constructors build — and `Timebase`'s docs now say what every road does
   with one. `Timestamp::duration` states its answer for a degenerate
-  timebase (zero, for any count), and `TimeRange::duration`'s panic docs
-  name the endpoint setters, which assign without checking, as the one
-  remaining way to build an inverted range.
+  timebase (zero, for any count).
 
 ## [0.4.0] - 2026-08-27
 

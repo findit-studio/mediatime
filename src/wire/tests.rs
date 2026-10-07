@@ -380,3 +380,20 @@ fn an_absent_timebase_is_refused_at_conversion_by_name() {
     Err(ConversionError::MissingTimebase)
   );
 }
+
+quickcheck::quickcheck! {
+  /// Over every range the domain type can hold, the two conversions are
+  /// inverses, and the domain codec reads back what it writes — so this
+  /// version never writes a range it cannot read.
+  fn the_conversions_are_inverses_over_every_range(a: i64, b: i64, num: u32, den: u32) -> bool {
+    let timebase = crate::Timebase::new(
+      (num % (i32::MAX as u32 + 1)) as i32,
+      nz((den % i32::MAX as u32 + 1) as i32),
+    );
+    let range = crate::TimeRange::new(a.min(b), a.max(b), timebase);
+    let wire = TimeRange::from(range);
+    let decoded = <crate::TimeRange as Message>::decode_from_slice(&range.encode_to_vec());
+    crate::TimeRange::try_from(wire).map(TimeRange::from) == Ok(wire)
+      && decoded.ok().map(TimeRange::from) == Some(wire)
+  }
+}

@@ -887,4 +887,11 @@ quickcheck! {
         && (n == f || n == c),
     )
   }
+
+  /// `duration` is the span `duration_since` measures between the ends, for
+  /// every range there is: it drops only the refusal no range can reach.
+  fn a_ranges_duration_is_the_span_between_its_ends(a: i64, b: i64, tb: (u32, u32)) -> bool {
+    let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
+    Some(range.duration()) == range.end().duration_since(&range.start())
+  }
 }

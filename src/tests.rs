@@ -1896,20 +1896,68 @@ fn timestamp_saturating_add_signed_panics_on_a_degenerate_timebase() {
 }
 
 #[test]
-fn time_range_builders_and_setters() {
-  let tb = Timebase::new(1, nz(1000));
-  let r = TimeRange::new(0, 0, tb);
+fn time_range_endpoints_move_only_in_order() {
+  let ms = Timebase::MILLIS;
+  let r = TimeRange::new(0, 10, ms);
 
-  // with_start / with_end — consuming form.
-  let r2 = r.with_start(100).with_end(500);
-  assert_eq!(r2.start_pts(), 100);
-  assert_eq!(r2.end_pts(), 500);
+  // One end at a time: admitted up to the other end, refused past it.
+  assert_eq!(r.try_with_start(10), Ok(TimeRange::new(10, 10, ms)));
+  assert_eq!(r.try_with_start(11), Err(InvertedRange(())));
+  assert_eq!(r.try_with_end(0), Ok(TimeRange::new(0, 0, ms)));
+  assert_eq!(r.try_with_end(-1), Err(InvertedRange(())));
+  assert_eq!(
+    r.try_with_end(500).and_then(|r| r.try_with_start(100)),
+    Ok(TimeRange::new(100, 500, ms))
+  );
 
-  // set_start / set_end — in-place form, chainable.
-  let mut r3 = TimeRange::new(0, 0, tb);
-  r3.set_start(10).set_end(20);
-  assert_eq!(r3.start_pts(), 10);
-  assert_eq!(r3.end_pts(), 20);
+  // In place, chainable — and a refusal leaves the range as it was.
+  let mut m = r;
+  assert_eq!(m.try_set_start(20).err(), Some(InvertedRange(())));
+  assert_eq!(m, r);
+  m.try_set_end(30).unwrap().try_set_start(20).unwrap();
+  assert_eq!(m, TimeRange::new(20, 30, ms));
+  assert_eq!(m.try_set_end(19).err(), Some(InvertedRange(())));
+  assert_eq!(m, TimeRange::new(20, 30, ms));
+
+  // Both ends at once: the move one end at a time refuses halfway.
+  assert!(r.try_with_start(20).is_err());
+  assert_eq!(r.with_bounds(20, 30), TimeRange::new(20, 30, ms));
+  let mut b = r;
+  b.set_bounds(20, 30);
+  assert_eq!(b, TimeRange::new(20, 30, ms));
+  assert_eq!(b.timebase(), ms, "the timebase stays");
+
+  assert_eq!(
+    format!("{}", InvertedRange(())),
+    "time range end must not precede start"
+  );
+}
+
+#[test]
+#[should_panic(expected = "end must not precede start")]
+fn with_bounds_panics_on_inverted_bounds() {
+  let _ = TimeRange::new(0, 10, Timebase::MILLIS).with_bounds(30, 20);
+}
+
+#[test]
+#[should_panic(expected = "end must not precede start")]
+fn set_bounds_panics_on_inverted_bounds() {
+  TimeRange::new(0, 10, Timebase::MILLIS).set_bounds(30, 20);
+}
+
+#[test]
+fn duration_is_total_at_the_extremes() {
+  // The widest range there is: 2^64 - 1 ticks, which `end - start` cannot
+  // hold in an `i64`.
+  let widest = TimeRange::new(i64::MIN, i64::MAX, Timebase::NANOS);
+  assert_eq!(
+    widest.duration(),
+    StdDuration::new(18_446_744_073, 709_551_615)
+  );
+  let clamped = TimeRange::new(i64::MIN, i64::MAX, Timebase::new(i32::MAX, nz(1)));
+  assert_eq!(clamped.duration(), StdDuration::MAX);
+  let degenerate = TimeRange::new(-5, 5, Timebase::new(0, nz(3)));
+  assert_eq!(degenerate.duration(), StdDuration::ZERO);
 }
 
 #[test]

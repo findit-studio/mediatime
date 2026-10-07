@@ -2431,6 +2431,23 @@ impl Ord for ExactSeconds {
     cmp_fractions(self.num, self.den.get(), other.num, other.den.get())
   }
 }
+/// Returned when a change to a [`TimeRange`] would put its `end` before its
+/// `start`.
+///
+/// A range's endpoints are ordered by construction: [`TimeRange::try_new`],
+/// [`TimeRange::try_with_start`] and their kin answer with this rather than
+/// hand out an inverted range, and serde reads one as this error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InvertedRange(());
+
+impl fmt::Display for InvertedRange {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("time range end must not precede start")
+  }
+}
+
+impl core::error::Error for InvertedRange {}
+
 /// A half-open time range `[start, end)` in a given [`Timebase`].
 ///
 /// Represents the extent of a detected event — for example, a fade-out →
@@ -2584,31 +2601,84 @@ impl TimeRange {
     Timestamp::new(self.end, self.timebase)
   }
 
-  /// Sets the start PTS.
+  /// Moves the start to `start`, or refuses with [`InvertedRange`] if that
+  /// would put it after the end.
+  ///
+  /// An endpoint moves only through a road that keeps the order — there is no
+  /// unchecked setter:
+  ///
+  /// ```compile_fail,E0599
+  /// use mediatime::{TimeRange, Timebase};
+  ///
+  /// let r = TimeRange::new(0, 1, Timebase::MILLIS).with_start(2);
+  /// ```
+  ///
+  /// To move both ends past each other, which no order of single moves can
+  /// do, use [`Self::with_bounds`].
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_start(mut self, val: i64) -> Self {
-    self.start = val;
-    self
+  pub const fn try_with_start(self, start: i64) -> Result<Self, InvertedRange> {
+    match Self::try_new(start, self.end, self.timebase) {
+      Some(range) => Ok(range),
+      None => Err(InvertedRange(())),
+    }
   }
 
-  /// Sets the start PTS in place.
+  /// Moves the end to `end`, or refuses with [`InvertedRange`] if that would
+  /// put it before the start.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_start(&mut self, val: i64) -> &mut Self {
-    self.start = val;
-    self
+  pub const fn try_with_end(self, end: i64) -> Result<Self, InvertedRange> {
+    match Self::try_new(self.start, end, self.timebase) {
+      Some(range) => Ok(range),
+      None => Err(InvertedRange(())),
+    }
   }
 
-  /// Sets the end PTS.
+  /// Moves the start to `start` in place, or refuses with [`InvertedRange`]
+  /// and leaves the range as it was.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_end(mut self, val: i64) -> Self {
-    self.end = val;
-    self
+  pub const fn try_set_start(&mut self, start: i64) -> Result<&mut Self, InvertedRange> {
+    if start <= self.end {
+      self.start = start;
+      Ok(self)
+    } else {
+      Err(InvertedRange(()))
+    }
   }
 
-  /// Sets the end PTS in place.
+  /// Moves the end to `end` in place, or refuses with [`InvertedRange`] and
+  /// leaves the range as it was.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_end(&mut self, val: i64) -> &mut Self {
-    self.end = val;
+  pub const fn try_set_end(&mut self, end: i64) -> Result<&mut Self, InvertedRange> {
+    if self.start <= end {
+      self.end = end;
+      Ok(self)
+    } else {
+      Err(InvertedRange(()))
+    }
+  }
+
+  /// Both endpoints at once, in the same timebase: the move from `[0, 10)` to
+  /// `[20, 30)` that one end at a time would refuse halfway.
+  ///
+  /// [`Self::try_new`] with this range's timebase is the fallible form.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `end < start`, as [`Self::new`] does.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_bounds(self, start: i64, end: i64) -> Self {
+    Self::new(start, end, self.timebase)
+  }
+
+  /// Both endpoints at once, in place — [`Self::with_bounds`] on `self`.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `end < start`, as [`Self::new`] does, leaving the range as it
+  /// was.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_bounds(&mut self, start: i64, end: i64) -> &mut Self {
+    *self = Self::new(start, end, self.timebase);
     self
   }
 
@@ -2711,20 +2781,24 @@ impl TimeRange {
 
   /// Returns the elapsed [`StdDuration`] from `start` to `end`.
   ///
-  /// # Panics
-  ///
-  /// Panics if `end` precedes `start`. Every constructor refuses such a
-  /// range, and so do serde and the `buffa` decoder; [`Self::rescale_to`]
-  /// preserves the order. The endpoint setters ([`Self::set_start`],
-  /// [`Self::set_end`] and their `with_` forms) assign without checking, so a
-  /// caller moving both ends can pass through an inverted range, and this
-  /// panics if called on one.
+  /// Total: `start <= end` holds for every range there is — every
+  /// constructor, setter and decoder keeps it — so the span is never
+  /// negative. It is `(end - start) · num / den` seconds, truncated once at
+  /// the nanosecond as [`Timestamp::duration_since`] truncates, and clamped
+  /// at [`StdDuration::MAX`]. A degenerate timebase measures zero.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> StdDuration {
-    self
-      .end()
-      .duration_since(&self.start())
-      .expect("end must not precede start")
+    // In `[0, 2^64)` ticks, and under `2^95` once multiplied by an `i32`
+    // numerator.
+    let ticks = (self.end as i128 - self.start as i128) as u128;
+    let span = ticks * (self.timebase.num as u128);
+    let den = self.timebase.den.get() as u128;
+    let secs = span / den;
+    if secs > u64::MAX as u128 {
+      return StdDuration::MAX;
+    }
+    let nanos = (span % den) * NANOS_PER_SEC / den;
+    StdDuration::new(secs as u64, nanos as u32)
   }
 
   /// Returns a new `TimeRange` representing the same span in a different timebase.
@@ -3122,10 +3196,10 @@ impl fmt::Display for Rate {
 /// docs](Timebase#why-a-zero-numerator-is-legal) say why it is legal.
 #[cfg(feature = "serde")]
 mod de {
-  use core::{fmt, num::NonZeroI32};
+  use core::num::NonZeroI32;
   use serde::{Deserialize, Deserializer, de::Error};
 
-  use crate::{TimeRange, Timebase};
+  use crate::{InvertedRange, TimeRange, Timebase};
 
   pub(super) fn de_num<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
     let v = i32::deserialize(d)?;
@@ -3155,20 +3229,11 @@ mod de {
     timebase: Timebase,
   }
 
-  /// A [`TimeRange`] arrived with its endpoints in the wrong order.
-  pub(super) struct InvertedRange;
-
-  impl fmt::Display for InvertedRange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-      f.write_str("time range end must not precede start")
-    }
-  }
-
   impl TryFrom<TimeRangeRepr> for TimeRange {
     type Error = InvertedRange;
 
     fn try_from(repr: TimeRangeRepr) -> Result<Self, Self::Error> {
-      Self::try_new(repr.start, repr.end, repr.timebase).ok_or(InvertedRange)
+      Self::try_new(repr.start, repr.end, repr.timebase).ok_or(InvertedRange(()))
     }
   }
 }
