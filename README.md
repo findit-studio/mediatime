@@ -152,7 +152,7 @@ assert_eq!("25".parse::<Rate>(), Ok(Rate::FPS_25));
 
 ```toml
 [dependencies]
-mediatime = "0.4"
+mediatime = "0.5"
 ```
 
 ## MSRV
