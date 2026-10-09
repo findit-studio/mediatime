@@ -135,6 +135,7 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// | [`checked_recip`](Self::checked_recip) and [`Rate`]'s reciprocal roads | `None` from the `checked_` ones, a panic from the rest: there is no reciprocal |
 /// | the `cmp_semantic`s, [`Timestamp`]'s `==`, the [`TimeRange`] predicates | every count names instant zero, or measures zero |
 /// | [`TimeRange::span`] | the counts' difference as written, `end - start` ticks of it, each measuring zero |
+/// | [`TimeRange::coarsest_whole_rate`] | `None`: the counts measure nothing, and no ruler they were counted in is there to coarsen |
 /// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
 /// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
 /// | [`Rate::as_f64`] | `0.0` |
@@ -2839,6 +2840,72 @@ impl TimeRange {
     // in `i128` is exact and fits a `u64`.
     let ticks = (self.end as i128 - self.start as i128) as u64;
     Duration::new(ticks, self.timebase)
+  }
+
+  /// The coarsest whole rate that holds the range: the fewest whole ticks a
+  /// second, `r`, on whose ticks the start and the end both land — answered
+  /// as the rate `r/1`, whose [`to_timebase`](Rate::to_timebase) is the
+  /// `1/r` ruler itself — or `None` for a range in a degenerate timebase.
+  ///
+  /// `n` ticks of `num/den` seconds are a whole number of ticks of `1/R`
+  /// seconds exactly when `den` divides `n · num · R`. For the start and the
+  /// end together that is when `den` divides `g · num · R`, `g` the greatest
+  /// common divisor of their counts — equally of the start and the
+  /// [`span`](Self::span), which is how it is computed — so the least such
+  /// `R` is
+  ///
+  /// ```text
+  /// r = den / gcd(den, g · num)
+  /// ```
+  ///
+  /// and **the whole rates that hold the range are exactly the multiples of
+  /// `r`**: `den / gcd(den, g · num)` and `g · num / gcd(den, g · num)` share
+  /// no factor, so `den` divides `g · num · R` if and only if `r` divides
+  /// `R`. A caller after a ruler that counts the range exactly can search the
+  /// multiples of the answer and nothing else; in every one of them both ends
+  /// rescale under [`Rounding::Exact`] wherever their counts fit an `i64`.
+  ///
+  /// Always a [`Rate`]: `r` divides `den`, so it lies in `1..=den` and is an
+  /// `i32` as `den` is. It reads the value, as the timebase's `==` does — a
+  /// range over `2/4` answers as one over `1/2` — and is `1` for a range
+  /// whose ends both sit at zero, which every whole rate holds. Exact, and
+  /// never past `u128`: `g` is under `2^64` and `g · num` under `2^95`.
+  ///
+  /// A degenerate `0/den` timebase answers `None`: its every count names
+  /// instant zero, so the counts measure nothing, and there is no ruler they
+  /// were counted in to coarsen.
+  ///
+  /// ```
+  /// use mediatime::{Rate, TimeRange, Timebase};
+  ///
+  /// // [100 ms, 500 ms) lands on tenths of a second, and on no coarser
+  /// // whole rate.
+  /// let r = TimeRange::new(100, 500, Timebase::MILLIS);
+  /// assert_eq!(r.coarsest_whole_rate(), Some(Rate::hz(10)));
+  ///
+  /// // Thirty 29.97 fps frames are exactly 1001 ms; one frame is 1001 ticks
+  /// // of 1/30000 s, and lands on no coarser whole rate.
+  /// let thirty = TimeRange::new(0, 30, Timebase::NTSC_VIDEO);
+  /// assert_eq!(thirty.coarsest_whole_rate(), Some(Rate::hz(1_000)));
+  /// let one = TimeRange::new(0, 1, Timebase::NTSC_VIDEO);
+  /// assert_eq!(one.coarsest_whole_rate(), Some(Rate::hz(30_000)));
+  /// ```
+  #[must_use]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn coarsest_whole_rate(&self) -> Option<Rate> {
+    if self.timebase.num == 0 {
+      return None;
+    }
+    let (num, den) = (self.timebase.num as u128, self.timebase.den.get() as u128);
+    // The start's magnitude and the length, each under 2^64, have the gcd
+    // the two ends have. Both zero, it is zero, and `gcd(den, 0) = den` makes
+    // `r = 1`.
+    let g = gcd_u128(self.start.unsigned_abs() as u128, self.span().ticks as u128);
+    let r = den / gcd_u128(den, g * num);
+    Some(Rate(Timebase {
+      num: r as i32,
+      den: DEN_ONE,
+    }))
   }
 
   /// Returns a new `TimeRange` representing the same span in a different timebase.

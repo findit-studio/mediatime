@@ -75,6 +75,80 @@ fn hash_of<T: Hash>(v: &T) -> u64 {
   h.finish()
 }
 
+/// Whether `count` ticks of `timebase` are a whole number of ticks of
+/// `1/rate` seconds — whether `den` divides `count · num · rate` — from the
+/// definition rather than the implementation, in residues so no product
+/// leaves `i128`.
+fn lands(count: i64, timebase: Timebase, rate: i128) -> bool {
+  let den = timebase.den().get() as i128;
+  let residue = (count as i128).rem_euclid(den) * (timebase.num() as i128) % den;
+  residue * rate.rem_euclid(den) % den == 0
+}
+
+/// The distinct primes dividing `n`, by trial division; `n` is at most
+/// `i32::MAX` here, so no divisor tried reaches 46 341.
+fn primes_of(mut n: i128) -> Vec<i128> {
+  let mut primes = Vec::new();
+  let mut p = 2;
+  while p * p <= n {
+    if n % p == 0 {
+      primes.push(p);
+      while n % p == 0 {
+        n /= p;
+      }
+    }
+    p += 1;
+  }
+  if n > 1 {
+    primes.push(n);
+  }
+  primes
+}
+
+/// The theorem `TimeRange::coarsest_whole_rate` states, on one range: `None`
+/// only for a degenerate timebase; else the answer `r/1` holds the range,
+/// and so does `r · (k + 1)`; no `r / p` does, `p` a prime of `r` — every
+/// rate `r` is a proper multiple of divides one of those, and a rate that
+/// holds the range passes the hold to its multiples — and `other + 1` holds
+/// it exactly when `r` divides it.
+fn holds_exactly_the_multiples(range: TimeRange, k: u16, other: u32) -> bool {
+  let timebase = range.timebase();
+  let Some(rate) = range.coarsest_whole_rate() else {
+    return timebase.num() == 0;
+  };
+  let r = rate.num() as i128;
+  let holds =
+    |rate: i128| lands(range.start_pts(), timebase, rate) && lands(range.end_pts(), timebase, rate);
+  let other = other as i128 + 1;
+  rate.den().get() == 1
+    && holds(r)
+    && holds(r * (k as i128 + 1))
+    && primes_of(r).into_iter().all(|p| !holds(r / p))
+    && holds(other) == (other % r == 0)
+}
+
+/// `coarsest_rate` as mediaio-timeline 0.1.0 writes it locally
+/// (`src/otio/export.rs`), operation for operation — the road the new method
+/// replaces there — over a `length` that crate measures itself.
+fn timelines_coarsest_rate(range: TimeRange, length: u64) -> Option<i32> {
+  fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+      (a, b) = (b, a % b);
+    }
+    a
+  }
+  let timebase = range.timebase();
+  let num = u128::try_from(timebase.num())
+    .ok()
+    .filter(|&num| num != 0)?;
+  let den = u128::try_from(timebase.den().get()).ok()?;
+  let common = gcd(
+    u128::from(range.start_pts().unsigned_abs()),
+    u128::from(length),
+  );
+  i32::try_from(den / gcd(den, common * num)).ok()
+}
+
 quickcheck! {
   /// Rescaling into the timebase a PTS is already counted in returns it
   /// unchanged — for every legal target and every `i64`.
@@ -912,5 +986,52 @@ quickcheck! {
       && span.timebase().is_identical(&range.timebase())
       && signed == fits.then(|| SignedDuration::new(span.ticks() as i64, range.timebase()))
       && between == Some(ExactSeconds::from_duration(span))
+  }
+
+  /// The coarsest whole rate is the one mediaio-timeline computes locally,
+  /// over every range that crate can measure — its length taken, as there,
+  /// by the checked difference of the ends — and comes back as `r/1`.
+  fn the_coarsest_whole_rate_is_the_one_the_timeline_computes(a: i64, b: i64, tb: (u32, u32)) -> TestResult {
+    let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
+    let Some(length) = range.end().checked_signed_duration_since(&range.start()) else {
+      return TestResult::discard();
+    };
+    let ours = range.coarsest_whole_rate();
+    TestResult::from_bool(
+      ours.map(|rate| rate.num()) == timelines_coarsest_rate(range, length.ticks() as u64)
+        && ours.is_none_or(|rate| rate.den().get() == 1),
+    )
+  }
+
+  /// The theorem, over full-range ends in every timebase: the whole rates
+  /// that hold a range are exactly the multiples of its coarsest.
+  fn the_whole_rates_that_hold_a_range_are_the_multiples_of_its_coarsest(a: i64, b: i64, tb: (u32, u32), k: u16, other: u32) -> bool {
+    let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
+    holds_exactly_the_multiples(range, k, other)
+  }
+
+  /// The same theorem over small ends in small timebases, degenerate ones
+  /// included, where the counts share factors with the denominator and the
+  /// answer is far coarser than it — the cancellation a full-range draw
+  /// rarely makes.
+  fn the_whole_rates_that_hold_a_small_range_are_the_multiples_of_its_coarsest(a: i8, b: i8, tb: (u8, u16), k: u16, other: u16) -> bool {
+    let timebase = Timebase::new(tb.0 as i32 % 13, nz(tb.1 as i32 % 3_600 + 1));
+    let range = TimeRange::new(a.min(b) as i64, a.max(b) as i64, timebase);
+    holds_exactly_the_multiples(range, k, other as u32)
+  }
+
+  /// Both ends recount into the answer's ruler exactly wherever their counts
+  /// fit an `i64` — the exact rescale a caller hands the recount to, which
+  /// answers under `Rounding::Exact` as it does under `Rounding::Floor`.
+  fn both_ends_rescale_exactly_into_the_coarsest_whole_rate(a: i64, b: i64, tb: (u32, u32)) -> bool {
+    let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
+    let Some(rate) = range.coarsest_whole_rate() else {
+      return range.timebase().num() == 0;
+    };
+    let ruler = rate.to_timebase();
+    [range.start(), range.end()].into_iter().all(|end| {
+      end.checked_rescale_with(ruler, Rounding::Exact)
+        == end.checked_rescale_with(ruler, Rounding::Floor)
+    })
   }
 }

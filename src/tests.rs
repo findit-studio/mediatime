@@ -2029,6 +2029,94 @@ fn a_ranges_span_is_total_at_the_extremes() {
   const { assert!(SPAN.ticks() == 15) };
 }
 
+/// Whether `count` ticks of `timebase` are a whole number of ticks of
+/// `1/rate` seconds — whether `den` divides `count · num · rate` — from the
+/// definition rather than the implementation, in residues so no product
+/// leaves `i128`.
+fn lands(count: i64, timebase: Timebase, rate: i128) -> bool {
+  let den = timebase.den().get() as i128;
+  let residue = (count as i128).rem_euclid(den) * (timebase.num() as i128) % den;
+  residue * rate.rem_euclid(den) % den == 0
+}
+
+#[test]
+fn the_coarsest_whole_rate_is_the_fewest_ticks_a_second_on_both_ends() {
+  let ms = Timebase::MILLIS;
+  let coarsest = |start, end, timebase| TimeRange::new(start, end, timebase).coarsest_whole_rate();
+  // [100 ms, 500 ms): tenths of a second.
+  assert_eq!(coarsest(100, 500, ms), Some(Rate::hz(10)));
+  // A negative start: -250 ms and 750 ms are -1 and 3 quarter seconds.
+  assert_eq!(coarsest(-250, 750, ms), Some(Rate::hz(4)));
+  // A start and a length whose gcd is 1: nothing coarser than the timebase.
+  assert_eq!(coarsest(3, 8, ms), Some(Rate::hz(1_000)));
+  // No length: at zero every whole rate holds it; at 5 ms, 200 a second.
+  assert_eq!(coarsest(0, 0, ms), Some(Rate::hz(1)));
+  assert_eq!(coarsest(5, 5, ms), Some(Rate::hz(200)));
+  assert_eq!(coarsest(-5, -5, ms), Some(Rate::hz(200)));
+  // NTSC: thirty frames are 1001 ms; one frame is 1001 ticks of 1/30000 s.
+  let ntsc = Timebase::NTSC_VIDEO;
+  assert_eq!(coarsest(0, 30, ntsc), Some(Rate::hz(1_000)));
+  assert_eq!(coarsest(0, 1, ntsc), Some(Rate::hz(30_000)));
+  assert_eq!(coarsest(1, 2, ntsc), Some(Rate::hz(30_000)));
+  // A 1/2 Hz clock — two seconds a tick — lands on whole seconds.
+  assert_eq!(coarsest(-3, 4, Timebase::new(2, nz(1))), Some(Rate::hz(1)));
+  // The value, not the spelling: 1/2 and 2/4 answer alike, and as r/1.
+  assert_eq!(coarsest(1, 2, Timebase::new(1, nz(2))), Some(Rate::hz(2)));
+  let halves = coarsest(1, 2, Timebase::new(2, nz(4))).unwrap();
+  assert_eq!((halves.num(), halves.den().get()), (2, 1));
+  // The finest it can be is the denominator itself.
+  assert_eq!(
+    coarsest(1, 2, Timebase::new(1, nz(i32::MAX))),
+    Some(Rate::hz(i32::MAX))
+  );
+  // The i64 extremes: the widest range of nanoseconds lands on nothing
+  // coarser, and `i64::MIN` ns alone is -2^54 ticks of 1/1953125 s.
+  let ns = Timebase::NANOS;
+  assert_eq!(
+    coarsest(i64::MIN, i64::MAX, ns),
+    Some(Rate::hz(1_000_000_000))
+  );
+  assert_eq!(coarsest(i64::MIN, i64::MIN, ns), Some(Rate::hz(1_953_125)));
+  assert_eq!(
+    coarsest(i64::MIN, i64::MAX, Timebase::SECONDS),
+    Some(Rate::hz(1))
+  );
+  // A degenerate timebase has no ruler to coarsen.
+  assert_eq!(coarsest(5, 10, Timebase::new(0, nz(7))), None);
+  // And it is usable where a constant is.
+  const TENTHS: Option<Rate> = TimeRange::new(100, 500, Timebase::MILLIS).coarsest_whole_rate();
+  assert_eq!(TENTHS, Some(Rate::hz(10)));
+}
+
+#[test]
+fn the_whole_rates_that_hold_a_range_are_the_multiples_of_its_coarsest() {
+  // Every range in a box — starts across zero, lengths from none, every
+  // timebase up to 6/24 — against every whole rate up to three times its
+  // denominator: each divisor of the answer, and three of its multiples.
+  for den in 1..=24 {
+    for num in 1..=6 {
+      let timebase = Timebase::new(num, nz(den));
+      for start in -12..=12_i64 {
+        for length in 0..=12_i64 {
+          let range = TimeRange::new(start, start + length, timebase);
+          let r = range
+            .coarsest_whole_rate()
+            .expect("the timebase spans time")
+            .num() as i128;
+          for rate in 1..=3 * den as i128 {
+            let holds = lands(start, timebase, rate) && lands(start + length, timebase, rate);
+            assert_eq!(
+              holds,
+              rate % r == 0,
+              "{range:#} at {rate}/s, coarsest {r}/s"
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
 #[test]
 fn time_range_rescale_to() {
   let ms = Timebase::new(1, nz(1000));
@@ -2932,10 +3020,12 @@ fn the_degenerate_timebase_on_every_road() {
   );
   assert!(!TimeRange::new(1, 9, zero).contains_instant(&Timestamp::new(0, ms)));
 
-  // A range's span counts its ticks as written, each measuring zero.
+  // A range's span counts its ticks as written, each measuring zero; no
+  // whole rate coarsens a ruler that measures nothing.
   let span = TimeRange::new(-5, 5, zero).span();
   assert_eq!(span, Duration::new(10, zero));
   assert_eq!(ExactSeconds::from_duration(span), ExactSeconds::ZERO);
+  assert_eq!(TimeRange::new(-5, 5, zero).coarsest_whole_rate(), None);
 
   // Exact seconds, and parsing.
   assert_eq!(
