@@ -139,6 +139,7 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
 /// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
 /// | [`Rate::as_f64`] | `0.0` |
+/// | [`Rate::checked_count`] | `(0, 1)`: no events, in any number of seconds |
 ///
 /// # Equality and ordering
 ///
@@ -2993,7 +2994,9 @@ impl fmt::Display for TimeRange {
 ///
 /// How long `n` events take — [`Self::checked_frames_to_duration`]. A timebase
 /// knows how long *one tick* is; how long *n frames* are is the rate's
-/// question, which is why that conversion lives here.
+/// question, which is why that conversion lives here. So is the converse, how
+/// many events an exact number of seconds holds — [`Self::checked_count`], a
+/// fraction where the seconds end between two events.
 ///
 /// # Construction, equality and ordering
 ///
@@ -3243,6 +3246,71 @@ impl Rate {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn saturating_frames_to_duration(&self, frames: i64) -> StdDuration {
     self.to_timebase().saturating_pts_to_duration(frames)
+  }
+
+  /// How many events of this rate `seconds` holds, exactly: the count as a
+  /// fraction in lowest terms, `(numerator, denominator)` with a positive
+  /// denominator — or `None` if either half leaves `i128`.
+  ///
+  /// The count is `seconds` times the rate, and nothing is rounded. Where
+  /// [`ExactSeconds`] reads a total back into a timebase only as a whole
+  /// number of ticks, by a [`Rounding`], this is the count before any
+  /// rounding, its fraction of an event included. At a rate with a ruler,
+  /// the denominator is `1` exactly when `seconds` lands on an event — where
+  /// [`ExactSeconds::checked_to_signed_duration`] into that ruler,
+  /// [`checked_to_timebase`](Self::checked_to_timebase), answers under
+  /// [`Rounding::Exact`], for a count that fits an `i64`.
+  ///
+  /// In lowest terms whatever the spelling: the rate is reduced first, so
+  /// `60000/2002` counts as `30000/1001` does, and the two fractions are
+  /// cancelled crosswise before they are multiplied. Each is in lowest terms,
+  /// so what is left of them shares no factor and the products are the count
+  /// in lowest terms, formed from the smallest operands it has: `None` means
+  /// exactly that the count's own numerator or denominator is not an `i128`.
+  ///
+  /// A negative number of seconds counts backwards. A degenerate rate — no
+  /// events a second — counts none in any number of seconds: `(0, 1)`.
+  ///
+  /// ```
+  /// use mediatime::{ExactSeconds, Rate, SignedDuration, Timebase};
+  ///
+  /// let seconds =
+  ///   |ticks, timebase| ExactSeconds::from_signed_duration(SignedDuration::new(ticks, timebase));
+  /// let count = |rate: Rate, s| rate.checked_count(s).map(|(n, d)| (n, d.get()));
+  ///
+  /// // 1001 ms is exactly thirty 29.97 fps frames; one second is 30000/1001
+  /// // frames — 29.97…, and no whole count.
+  /// let ntsc = Rate::FPS_29_97;
+  /// assert_eq!(count(ntsc, seconds(1_001, Timebase::MILLIS)), Some((30, 1)));
+  /// assert_eq!(count(ntsc, seconds(1, Timebase::SECONDS)), Some((30_000, 1_001)));
+  /// ```
+  #[must_use]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_count(&self, seconds: ExactSeconds) -> Option<(i128, NonZeroI128)> {
+    let rate = self.0.reduce();
+    // `events` events every `per` seconds, against `num / den` seconds.
+    let (events, per) = (rate.num as i128, rate.den.get() as i128);
+    let (num, den) = (seconds.num, seconds.den.get());
+    // Cancelled crosswise: `num` against `per`, `events` against `den`. Both
+    // fractions are in lowest terms, so what is left of the numerators shares
+    // no factor with what is left of the denominators, and the products are
+    // the count in lowest terms. Each gcd is at least 1, `per` and `den`
+    // being positive, and at most that positive operand, so it is an `i128`
+    // and divides exactly.
+    let g_per = gcd_u128(num.unsigned_abs(), per as u128) as i128;
+    let g_den = gcd_u128(events as u128, den as u128) as i128;
+    let count = match (num / g_per).checked_mul(events / g_den) {
+      Some(count) => count,
+      None => return None,
+    };
+    let den = match (den / g_den).checked_mul(per / g_per) {
+      Some(den) => den,
+      None => return None,
+    };
+    match NonZeroI128::new(den) {
+      Some(den) => Some((count, den)),
+      None => None,
+    }
   }
 
   /// The rate as an `f64`, in events per second: `30000/1001` reads

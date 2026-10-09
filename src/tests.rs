@@ -3010,6 +3010,11 @@ fn the_degenerate_timebase_on_every_road() {
   assert_eq!(Rate::checked_from_timebase(zero), None);
   assert_eq!(Rate::hz(0).checked_to_timebase(), None);
   assert_eq!(Rate::hz(0).checked_frames_to_duration(1), None);
+  // A degenerate rate counts no events, in any number of seconds.
+  assert_eq!(
+    Rate::fps(0, nz(7)).checked_count(seconds_of(9, Timebase::SECONDS)),
+    Some((0, nz128(1)))
+  );
 
   // Comparisons read instant zero.
   assert_eq!(Timestamp::new(5, zero), Timestamp::new(0, ms));
@@ -3126,4 +3131,146 @@ fn an_exact_sum_with_large_denominators_reads_back_whatever_its_size() {
   assert_eq!(read(Rounding::Floor), Some(-1));
   assert_eq!(read(Rounding::Ceil), Some(0));
   assert_eq!(read(Rounding::Nearest), Some(0));
+}
+
+/// `seconds` as a [`Rate::checked_count`] answer reads it: the pair, with the
+/// denominator unwrapped.
+fn count_of(rate: Rate, seconds: ExactSeconds) -> Option<(i128, i128)> {
+  rate.checked_count(seconds).map(|(n, d)| (n, d.get()))
+}
+
+/// `ticks` of `timebase`, as exact seconds.
+fn seconds_of(ticks: i64, timebase: Timebase) -> ExactSeconds {
+  ExactSeconds::from_signed_duration(SignedDuration::new(ticks, timebase))
+}
+
+#[test]
+fn a_count_at_a_rate_is_the_exact_fraction_of_its_events() {
+  let ntsc = Rate::FPS_29_97;
+  // 1001 ms is thirty NTSC frames; a second is 30000/1001 of one.
+  assert_eq!(
+    count_of(ntsc, seconds_of(1_001, Timebase::MILLIS)),
+    Some((30, 1))
+  );
+  assert_eq!(
+    count_of(ntsc, seconds_of(1, Timebase::SECONDS)),
+    Some((30_000, 1_001))
+  );
+  // A frame's own ruler counts one; at exactly 30 fps it is 1.001 frames.
+  assert_eq!(
+    count_of(ntsc, seconds_of(1, Timebase::NTSC_VIDEO)),
+    Some((1, 1))
+  );
+  assert_eq!(
+    count_of(Rate::FPS_30, seconds_of(1, Timebase::NTSC_VIDEO)),
+    Some((1_001, 1_000))
+  );
+  // Backwards, the count is negative and keeps its fraction.
+  assert_eq!(
+    count_of(ntsc, seconds_of(-1, Timebase::SECONDS)),
+    Some((-30_000, 1_001))
+  );
+  // Lowest terms whatever the rate's spelling: 60000/2002 is 29.97, and
+  // 48/2 a millisecond is 3/125 of an event.
+  assert_eq!(
+    count_of(
+      Rate::fps(60_000, nz(2002)),
+      seconds_of(1, Timebase::SECONDS)
+    ),
+    Some((30_000, 1_001))
+  );
+  assert_eq!(
+    count_of(Rate::fps(48, nz(2)), seconds_of(1, Timebase::MILLIS)),
+    Some((3, 125))
+  );
+  // A 1/2 Hz rate: an event every two seconds.
+  let half = Rate::fps(1, nz(2));
+  assert_eq!(
+    count_of(half, seconds_of(3, Timebase::SECONDS)),
+    Some((3, 2))
+  );
+  assert_eq!(
+    count_of(half, seconds_of(4, Timebase::SECONDS)),
+    Some((2, 1))
+  );
+  assert_eq!(
+    count_of(half, seconds_of(-3, Timebase::SECONDS)),
+    Some((-3, 2))
+  );
+  // Samples: a millisecond at 48 kHz is 48 of them; an MPEG tick, 8/15 of one.
+  let audio = Rate::hz(48_000);
+  assert_eq!(
+    count_of(audio, seconds_of(1, Timebase::MILLIS)),
+    Some((48, 1))
+  );
+  assert_eq!(
+    count_of(audio, seconds_of(1, Timebase::MPEG_90K)),
+    Some((8, 15))
+  );
+  // No time counts no events, and a degenerate rate counts none in any time.
+  assert_eq!(count_of(ntsc, ExactSeconds::ZERO), Some((0, 1)));
+  assert_eq!(
+    count_of(Rate::hz(0), seconds_of(i64::MAX, Timebase::SECONDS)),
+    Some((0, 1))
+  );
+  assert_eq!(
+    count_of(Rate::fps(0, nz(7)), seconds_of(-5, Timebase::MILLIS)),
+    Some((0, 1))
+  );
+  // And it is usable where a constant is.
+  const FRAMES: Option<(i128, NonZeroI128)> = Rate::FPS_29_97.checked_count(
+    ExactSeconds::from_signed_duration(SignedDuration::new(1_001, Timebase::MILLIS)),
+  );
+  assert_eq!(FRAMES.map(|(n, d)| (n, d.get())), Some((30, 1)));
+}
+
+#[test]
+fn a_count_refuses_only_what_i128_cannot_hold() {
+  // About 2^95 seconds — u64::MAX ticks of i32::MAX seconds — counted at
+  // i32::MAX a second: twice that is under 2^127 events, three times is not.
+  let big = ExactSeconds::from_duration(Duration::new(u64::MAX, Timebase::new(i32::MAX, nz(1))));
+  let twice = big.checked_add(big).unwrap();
+  let thrice = twice.checked_add(big).unwrap();
+  let fastest = Rate::hz(i32::MAX);
+  assert_eq!(
+    count_of(fastest, twice),
+    Some((twice.num() * i32::MAX as i128, 1))
+  );
+  assert_eq!(count_of(fastest, thrice), None);
+  assert_eq!(
+    count_of(fastest, ExactSeconds::ZERO.checked_sub(thrice).unwrap()),
+    None
+  );
+  assert_eq!(count_of(Rate::hz(1), thrice), Some((thrice.num(), 1)));
+
+  // A denominator past i128: four ticks of near-coprime timebases near
+  // i32::MAX sum over a denominator near 2^123, and one event every
+  // i32::MAX - 4 seconds shares no factor with it.
+  let mut sum = ExactSeconds::ZERO;
+  for k in 0..4 {
+    sum = sum
+      .checked_add(seconds_of(1, Timebase::new(1, nz(i32::MAX - k))))
+      .unwrap();
+  }
+  assert!(sum.den().get() > (1_i128 << 120));
+  assert_eq!(count_of(Rate::fps(1, nz(i32::MAX - 4)), sum), None);
+}
+
+#[test]
+fn a_count_cancels_before_it_multiplies() {
+  // N/2 seconds, N = (2^64 - 1)(2^31 - 1) odd, three times over: 3N/2. At
+  // 2^31 - 2 events a second the plain product 3N·(2^31 - 2) is past 2^127,
+  // and the count 3N·(2^30 - 1) — the 2 cancelled first — is not.
+  let half = ExactSeconds::from_duration(Duration::new(u64::MAX, Timebase::new(i32::MAX, nz(2))));
+  let thrice = half
+    .checked_add(half)
+    .and_then(|s| s.checked_add(half))
+    .unwrap();
+  let n = (u64::MAX as i128) * (i32::MAX as i128);
+  assert_eq!((thrice.num(), thrice.den().get()), (3 * n, 2));
+  assert_eq!((3 * n).checked_mul(i32::MAX as i128 - 1), None);
+  assert_eq!(
+    count_of(Rate::hz(i32::MAX - 1), thrice),
+    Some((3 * n * ((1 << 30) - 1), 1))
+  );
 }
