@@ -134,9 +134,12 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// | [`checked_pts_to_duration`](Self::checked_pts_to_duration), [`Duration::checked_to_std`], [`Timestamp::duration`] | zero — though the first still refuses a negative count for its sign |
 /// | [`checked_recip`](Self::checked_recip) and [`Rate`]'s reciprocal roads | `None` from the `checked_` ones, a panic from the rest: there is no reciprocal |
 /// | the `cmp_semantic`s, [`Timestamp`]'s `==`, the [`TimeRange`] predicates | every count names instant zero, or measures zero |
+/// | [`TimeRange::span`] | the counts' difference as written, `end - start` ticks of it, each measuring zero |
+/// | [`TimeRange::coarsest_whole_rate`] | `None`: the counts measure nothing, and no ruler they were counted in is there to coarsen |
 /// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
 /// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
 /// | [`Rate::as_f64`] | `0.0` |
+/// | [`Rate::checked_count`] | `(0, 1)`: no events, in any number of seconds |
 ///
 /// # Equality and ordering
 ///
@@ -2774,6 +2777,8 @@ impl TimeRange {
   /// Always non-negative given the `start <= end` constructor invariant.
   /// Saturates at `i64::MAX` in the pathological case where `end - start`
   /// would overflow `i64` (e.g., `start = i64::MIN`, `end = i64::MAX`).
+  /// [`Self::span`] is the same difference without the clamp, as a
+  /// [`Duration`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn total_pts(&self) -> i64 {
     self.end.saturating_sub(self.start)
@@ -2799,6 +2804,109 @@ impl TimeRange {
     }
     let nanos = (span % den) * NANOS_PER_SEC / den;
     StdDuration::new(secs as u64, nanos as u32)
+  }
+
+  /// The range's length as a [`Duration`] counted in its own timebase:
+  /// `end - start` ticks, exactly.
+  ///
+  /// Total: `start <= end` holds for every range there is — every
+  /// constructor, setter and decoder keeps it — so the difference is never
+  /// negative, and two `i64` endpoints lie at most `u64::MAX` ticks apart,
+  /// which is as far as a [`Duration`] counts. Nothing is refused, clamped
+  /// or rounded, which is what the two older measures cannot say:
+  /// [`Self::total_pts`] saturates at `i64::MAX`, so `[i64::MIN, i64::MAX)`
+  /// and `[0, i64::MAX)` measure alike there, and [`Self::duration`] is
+  /// truncated to the nanosecond.
+  ///
+  /// The timebase is the range's own, as written — a range over `2/2000`
+  /// spans ticks of `2/2000`. Under a degenerate `0/den` timebase the count
+  /// is still `end - start`, and each of its ticks measures zero, as every
+  /// [`Duration`] counted in one does.
+  ///
+  /// ```
+  /// use mediatime::{Duration, TimeRange, Timebase};
+  ///
+  /// let r = TimeRange::new(1_500, 3_250, Timebase::MILLIS);
+  /// assert_eq!(r.span(), Duration::new(1_750, Timebase::MILLIS));
+  ///
+  /// // The widest range there is: `total_pts` saturates, `span` does not.
+  /// let widest = TimeRange::new(i64::MIN, i64::MAX, Timebase::NANOS);
+  /// assert_eq!(widest.span().ticks(), u64::MAX);
+  /// assert_eq!(widest.total_pts(), i64::MAX);
+  /// ```
+  #[must_use]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn span(&self) -> Duration {
+    // In `[0, 2^64)`: the endpoints are ordered `i64`s, so their difference
+    // in `i128` is exact and fits a `u64`.
+    let ticks = (self.end as i128 - self.start as i128) as u64;
+    Duration::new(ticks, self.timebase)
+  }
+
+  /// The coarsest whole rate that holds the range: the fewest whole ticks a
+  /// second, `r`, on whose ticks the start and the end both land — answered
+  /// as the rate `r/1`, whose [`to_timebase`](Rate::to_timebase) is the
+  /// `1/r` ruler itself — or `None` for a range in a degenerate timebase.
+  ///
+  /// `n` ticks of `num/den` seconds are a whole number of ticks of `1/R`
+  /// seconds exactly when `den` divides `n · num · R`. For the start and the
+  /// end together that is when `den` divides `g · num · R`, `g` the greatest
+  /// common divisor of their counts — equally of the start and the
+  /// [`span`](Self::span), which is how it is computed — so the least such
+  /// `R` is
+  ///
+  /// ```text
+  /// r = den / gcd(den, g · num)
+  /// ```
+  ///
+  /// and **the whole rates that hold the range are exactly the multiples of
+  /// `r`**: `den / gcd(den, g · num)` and `g · num / gcd(den, g · num)` share
+  /// no factor, so `den` divides `g · num · R` if and only if `r` divides
+  /// `R`. A caller after a ruler that counts the range exactly can search the
+  /// multiples of the answer and nothing else; in every one of them both ends
+  /// rescale under [`Rounding::Exact`] wherever their counts fit an `i64`.
+  ///
+  /// Always a [`Rate`]: `r` divides `den`, so it lies in `1..=den` and is an
+  /// `i32` as `den` is. It reads the value, as the timebase's `==` does — a
+  /// range over `2/4` answers as one over `1/2` — and is `1` for a range
+  /// whose ends both sit at zero, which every whole rate holds. Exact, and
+  /// never past `u128`: `g` is under `2^64` and `g · num` under `2^95`.
+  ///
+  /// A degenerate `0/den` timebase answers `None`: its every count names
+  /// instant zero, so the counts measure nothing, and there is no ruler they
+  /// were counted in to coarsen.
+  ///
+  /// ```
+  /// use mediatime::{Rate, TimeRange, Timebase};
+  ///
+  /// // [100 ms, 500 ms) lands on tenths of a second, and on no coarser
+  /// // whole rate.
+  /// let r = TimeRange::new(100, 500, Timebase::MILLIS);
+  /// assert_eq!(r.coarsest_whole_rate(), Some(Rate::hz(10)));
+  ///
+  /// // Thirty 29.97 fps frames are exactly 1001 ms; one frame is 1001 ticks
+  /// // of 1/30000 s, and lands on no coarser whole rate.
+  /// let thirty = TimeRange::new(0, 30, Timebase::NTSC_VIDEO);
+  /// assert_eq!(thirty.coarsest_whole_rate(), Some(Rate::hz(1_000)));
+  /// let one = TimeRange::new(0, 1, Timebase::NTSC_VIDEO);
+  /// assert_eq!(one.coarsest_whole_rate(), Some(Rate::hz(30_000)));
+  /// ```
+  #[must_use]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn coarsest_whole_rate(&self) -> Option<Rate> {
+    if self.timebase.num == 0 {
+      return None;
+    }
+    let (num, den) = (self.timebase.num as u128, self.timebase.den.get() as u128);
+    // The start's magnitude and the length, each under 2^64, have the gcd
+    // the two ends have. Both zero, it is zero, and `gcd(den, 0) = den` makes
+    // `r = 1`.
+    let g = gcd_u128(self.start.unsigned_abs() as u128, self.span().ticks as u128);
+    let r = den / gcd_u128(den, g * num);
+    Some(Rate(Timebase {
+      num: r as i32,
+      den: DEN_ONE,
+    }))
   }
 
   /// Returns a new `TimeRange` representing the same span in a different timebase.
@@ -2886,7 +2994,9 @@ impl fmt::Display for TimeRange {
 ///
 /// How long `n` events take — [`Self::checked_frames_to_duration`]. A timebase
 /// knows how long *one tick* is; how long *n frames* are is the rate's
-/// question, which is why that conversion lives here.
+/// question, which is why that conversion lives here. So is the converse, how
+/// many events an exact number of seconds holds — [`Self::checked_count`], a
+/// fraction where the seconds end between two events.
 ///
 /// # Construction, equality and ordering
 ///
@@ -3136,6 +3246,71 @@ impl Rate {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn saturating_frames_to_duration(&self, frames: i64) -> StdDuration {
     self.to_timebase().saturating_pts_to_duration(frames)
+  }
+
+  /// How many events of this rate `seconds` holds, exactly: the count as a
+  /// fraction in lowest terms, `(numerator, denominator)` with a positive
+  /// denominator — or `None` if either half leaves `i128`.
+  ///
+  /// The count is `seconds` times the rate, and nothing is rounded. Where
+  /// [`ExactSeconds`] reads a total back into a timebase only as a whole
+  /// number of ticks, by a [`Rounding`], this is the count before any
+  /// rounding, its fraction of an event included. At a rate with a ruler,
+  /// the denominator is `1` exactly when `seconds` lands on an event — where
+  /// [`ExactSeconds::checked_to_signed_duration`] into that ruler,
+  /// [`checked_to_timebase`](Self::checked_to_timebase), answers under
+  /// [`Rounding::Exact`], for a count that fits an `i64`.
+  ///
+  /// In lowest terms whatever the spelling: the rate is reduced first, so
+  /// `60000/2002` counts as `30000/1001` does, and the two fractions are
+  /// cancelled crosswise before they are multiplied. Each is in lowest terms,
+  /// so what is left of them shares no factor and the products are the count
+  /// in lowest terms, formed from the smallest operands it has: `None` means
+  /// exactly that the count's own numerator or denominator is not an `i128`.
+  ///
+  /// A negative number of seconds counts backwards. A degenerate rate — no
+  /// events a second — counts none in any number of seconds: `(0, 1)`.
+  ///
+  /// ```
+  /// use mediatime::{ExactSeconds, Rate, SignedDuration, Timebase};
+  ///
+  /// let seconds =
+  ///   |ticks, timebase| ExactSeconds::from_signed_duration(SignedDuration::new(ticks, timebase));
+  /// let count = |rate: Rate, s| rate.checked_count(s).map(|(n, d)| (n, d.get()));
+  ///
+  /// // 1001 ms is exactly thirty 29.97 fps frames; one second is 30000/1001
+  /// // frames — 29.97…, and no whole count.
+  /// let ntsc = Rate::FPS_29_97;
+  /// assert_eq!(count(ntsc, seconds(1_001, Timebase::MILLIS)), Some((30, 1)));
+  /// assert_eq!(count(ntsc, seconds(1, Timebase::SECONDS)), Some((30_000, 1_001)));
+  /// ```
+  #[must_use]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn checked_count(&self, seconds: ExactSeconds) -> Option<(i128, NonZeroI128)> {
+    let rate = self.0.reduce();
+    // `events` events every `per` seconds, against `num / den` seconds.
+    let (events, per) = (rate.num as i128, rate.den.get() as i128);
+    let (num, den) = (seconds.num, seconds.den.get());
+    // Cancelled crosswise: `num` against `per`, `events` against `den`. Both
+    // fractions are in lowest terms, so what is left of the numerators shares
+    // no factor with what is left of the denominators, and the products are
+    // the count in lowest terms. Each gcd is at least 1, `per` and `den`
+    // being positive, and at most that positive operand, so it is an `i128`
+    // and divides exactly.
+    let g_per = gcd_u128(num.unsigned_abs(), per as u128) as i128;
+    let g_den = gcd_u128(events as u128, den as u128) as i128;
+    let count = match (num / g_per).checked_mul(events / g_den) {
+      Some(count) => count,
+      None => return None,
+    };
+    let den = match (den / g_den).checked_mul(per / g_per) {
+      Some(den) => den,
+      None => return None,
+    };
+    match NonZeroI128::new(den) {
+      Some(den) => Some((count, den)),
+      None => None,
+    }
   }
 
   /// The rate as an `f64`, in events per second: `30000/1001` reads

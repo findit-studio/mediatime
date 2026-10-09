@@ -1970,6 +1970,154 @@ fn time_range_total_pts() {
 }
 
 #[test]
+fn a_ranges_span_is_its_length_in_its_own_timebase() {
+  let ms = Timebase::MILLIS;
+  assert_eq!(
+    TimeRange::new(1_500, 3_250, ms).span(),
+    Duration::new(1_750, ms)
+  );
+  // A negative start, and ranges of no length at either sign.
+  assert_eq!(
+    TimeRange::new(-90_000, 45_000, Timebase::MPEG_90K).span(),
+    Duration::new(135_000, Timebase::MPEG_90K)
+  );
+  assert!(TimeRange::new(-5, -5, ms).span().is_zero());
+  assert!(TimeRange::new(7, 7, ms).span().is_zero());
+  // The timebase as written: a range over 2/2000 spans ticks of 2/2000.
+  let doubled = Timebase::new(2, nz(2000));
+  let span = TimeRange::new(0, 3, doubled).span();
+  assert_eq!(span.ticks(), 3);
+  assert!(span.timebase().is_identical(&doubled));
+  // Counted, not measured: thirty NTSC frames, and seven ticks of a 1/2 Hz
+  // clock, which are fourteen seconds.
+  assert_eq!(
+    TimeRange::new(1, 31, Timebase::NTSC_VIDEO).span(),
+    Duration::new(30, Timebase::NTSC_VIDEO)
+  );
+  let two_seconds = Timebase::new(2, nz(1));
+  assert_eq!(
+    ExactSeconds::from_duration(TimeRange::new(-3, 4, two_seconds).span()),
+    ExactSeconds::from_signed_duration(SignedDuration::new(14, Timebase::SECONDS))
+  );
+}
+
+#[test]
+fn a_ranges_span_is_total_at_the_extremes() {
+  let ns = Timebase::NANOS;
+  // `total_pts` saturates at `i64::MAX`, so the widest range and `[0,
+  // i64::MAX)` measure alike there; the span tells them apart.
+  let widest = TimeRange::new(i64::MIN, i64::MAX, ns);
+  let longest_signed = TimeRange::new(0, i64::MAX, ns);
+  assert_eq!(widest.total_pts(), longest_signed.total_pts());
+  assert_eq!(widest.span(), Duration::new(u64::MAX, ns));
+  assert_eq!(longest_signed.span(), Duration::new(i64::MAX as u64, ns));
+  // One tick past `i64::MAX`: the first span a signed difference of the
+  // ends has no room for.
+  assert_eq!(
+    TimeRange::new(-1, i64::MAX, ns).span(),
+    Duration::new(1 << 63, ns)
+  );
+  assert!(TimeRange::new(i64::MIN, i64::MIN, ns).span().is_zero());
+  assert!(TimeRange::new(i64::MAX, i64::MAX, ns).span().is_zero());
+  // A degenerate timebase counts its ticks as written; they measure zero.
+  let zero = Timebase::new(0, nz(3));
+  let degenerate = TimeRange::new(i64::MIN, i64::MAX, zero).span();
+  assert_eq!(degenerate, Duration::new(u64::MAX, zero));
+  assert_eq!(ExactSeconds::from_duration(degenerate), ExactSeconds::ZERO);
+  // And it is usable where a constant is.
+  const SPAN: Duration = TimeRange::new(10, 25, Timebase::MILLIS).span();
+  const { assert!(SPAN.ticks() == 15) };
+}
+
+/// Whether `count` ticks of `timebase` are a whole number of ticks of
+/// `1/rate` seconds — whether `den` divides `count · num · rate` — from the
+/// definition rather than the implementation, in residues so no product
+/// leaves `i128`.
+fn lands(count: i64, timebase: Timebase, rate: i128) -> bool {
+  let den = timebase.den().get() as i128;
+  let residue = (count as i128).rem_euclid(den) * (timebase.num() as i128) % den;
+  residue * rate.rem_euclid(den) % den == 0
+}
+
+#[test]
+fn the_coarsest_whole_rate_is_the_fewest_ticks_a_second_on_both_ends() {
+  let ms = Timebase::MILLIS;
+  let coarsest = |start, end, timebase| TimeRange::new(start, end, timebase).coarsest_whole_rate();
+  // [100 ms, 500 ms): tenths of a second.
+  assert_eq!(coarsest(100, 500, ms), Some(Rate::hz(10)));
+  // A negative start: -250 ms and 750 ms are -1 and 3 quarter seconds.
+  assert_eq!(coarsest(-250, 750, ms), Some(Rate::hz(4)));
+  // A start and a length whose gcd is 1: nothing coarser than the timebase.
+  assert_eq!(coarsest(3, 8, ms), Some(Rate::hz(1_000)));
+  // No length: at zero every whole rate holds it; at 5 ms, 200 a second.
+  assert_eq!(coarsest(0, 0, ms), Some(Rate::hz(1)));
+  assert_eq!(coarsest(5, 5, ms), Some(Rate::hz(200)));
+  assert_eq!(coarsest(-5, -5, ms), Some(Rate::hz(200)));
+  // NTSC: thirty frames are 1001 ms; one frame is 1001 ticks of 1/30000 s.
+  let ntsc = Timebase::NTSC_VIDEO;
+  assert_eq!(coarsest(0, 30, ntsc), Some(Rate::hz(1_000)));
+  assert_eq!(coarsest(0, 1, ntsc), Some(Rate::hz(30_000)));
+  assert_eq!(coarsest(1, 2, ntsc), Some(Rate::hz(30_000)));
+  // A 1/2 Hz clock — two seconds a tick — lands on whole seconds.
+  assert_eq!(coarsest(-3, 4, Timebase::new(2, nz(1))), Some(Rate::hz(1)));
+  // The value, not the spelling: 1/2 and 2/4 answer alike, and as r/1.
+  assert_eq!(coarsest(1, 2, Timebase::new(1, nz(2))), Some(Rate::hz(2)));
+  let halves = coarsest(1, 2, Timebase::new(2, nz(4))).unwrap();
+  assert_eq!((halves.num(), halves.den().get()), (2, 1));
+  // The finest it can be is the denominator itself.
+  assert_eq!(
+    coarsest(1, 2, Timebase::new(1, nz(i32::MAX))),
+    Some(Rate::hz(i32::MAX))
+  );
+  // The i64 extremes: the widest range of nanoseconds lands on nothing
+  // coarser, and `i64::MIN` ns alone is -2^54 ticks of 1/1953125 s.
+  let ns = Timebase::NANOS;
+  assert_eq!(
+    coarsest(i64::MIN, i64::MAX, ns),
+    Some(Rate::hz(1_000_000_000))
+  );
+  assert_eq!(coarsest(i64::MIN, i64::MIN, ns), Some(Rate::hz(1_953_125)));
+  assert_eq!(
+    coarsest(i64::MIN, i64::MAX, Timebase::SECONDS),
+    Some(Rate::hz(1))
+  );
+  // A degenerate timebase has no ruler to coarsen.
+  assert_eq!(coarsest(5, 10, Timebase::new(0, nz(7))), None);
+  // And it is usable where a constant is.
+  const TENTHS: Option<Rate> = TimeRange::new(100, 500, Timebase::MILLIS).coarsest_whole_rate();
+  assert_eq!(TENTHS, Some(Rate::hz(10)));
+}
+
+#[test]
+fn the_whole_rates_that_hold_a_range_are_the_multiples_of_its_coarsest() {
+  // Every range in a box — starts across zero, lengths from none, every
+  // timebase up to 6/24 — against every whole rate up to three times its
+  // denominator: each divisor of the answer, and three of its multiples.
+  for den in 1..=24 {
+    for num in 1..=6 {
+      let timebase = Timebase::new(num, nz(den));
+      for start in -12..=12_i64 {
+        for length in 0..=12_i64 {
+          let range = TimeRange::new(start, start + length, timebase);
+          let r = range
+            .coarsest_whole_rate()
+            .expect("the timebase spans time")
+            .num() as i128;
+          for rate in 1..=3 * den as i128 {
+            let holds = lands(start, timebase, rate) && lands(start + length, timebase, rate);
+            assert_eq!(
+              holds,
+              rate % r == 0,
+              "{range:#} at {rate}/s, coarsest {r}/s"
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
+#[test]
 fn time_range_rescale_to() {
   let ms = Timebase::new(1, nz(1000));
   let mpeg = Timebase::new(1, nz(90_000));
@@ -2862,6 +3010,11 @@ fn the_degenerate_timebase_on_every_road() {
   assert_eq!(Rate::checked_from_timebase(zero), None);
   assert_eq!(Rate::hz(0).checked_to_timebase(), None);
   assert_eq!(Rate::hz(0).checked_frames_to_duration(1), None);
+  // A degenerate rate counts no events, in any number of seconds.
+  assert_eq!(
+    Rate::fps(0, nz(7)).checked_count(seconds_of(9, Timebase::SECONDS)),
+    Some((0, nz128(1)))
+  );
 
   // Comparisons read instant zero.
   assert_eq!(Timestamp::new(5, zero), Timestamp::new(0, ms));
@@ -2871,6 +3024,13 @@ fn the_degenerate_timebase_on_every_road() {
       .is_eq()
   );
   assert!(!TimeRange::new(1, 9, zero).contains_instant(&Timestamp::new(0, ms)));
+
+  // A range's span counts its ticks as written, each measuring zero; no
+  // whole rate coarsens a ruler that measures nothing.
+  let span = TimeRange::new(-5, 5, zero).span();
+  assert_eq!(span, Duration::new(10, zero));
+  assert_eq!(ExactSeconds::from_duration(span), ExactSeconds::ZERO);
+  assert_eq!(TimeRange::new(-5, 5, zero).coarsest_whole_rate(), None);
 
   // Exact seconds, and parsing.
   assert_eq!(
@@ -2971,4 +3131,146 @@ fn an_exact_sum_with_large_denominators_reads_back_whatever_its_size() {
   assert_eq!(read(Rounding::Floor), Some(-1));
   assert_eq!(read(Rounding::Ceil), Some(0));
   assert_eq!(read(Rounding::Nearest), Some(0));
+}
+
+/// `seconds` as a [`Rate::checked_count`] answer reads it: the pair, with the
+/// denominator unwrapped.
+fn count_of(rate: Rate, seconds: ExactSeconds) -> Option<(i128, i128)> {
+  rate.checked_count(seconds).map(|(n, d)| (n, d.get()))
+}
+
+/// `ticks` of `timebase`, as exact seconds.
+fn seconds_of(ticks: i64, timebase: Timebase) -> ExactSeconds {
+  ExactSeconds::from_signed_duration(SignedDuration::new(ticks, timebase))
+}
+
+#[test]
+fn a_count_at_a_rate_is_the_exact_fraction_of_its_events() {
+  let ntsc = Rate::FPS_29_97;
+  // 1001 ms is thirty NTSC frames; a second is 30000/1001 of one.
+  assert_eq!(
+    count_of(ntsc, seconds_of(1_001, Timebase::MILLIS)),
+    Some((30, 1))
+  );
+  assert_eq!(
+    count_of(ntsc, seconds_of(1, Timebase::SECONDS)),
+    Some((30_000, 1_001))
+  );
+  // A frame's own ruler counts one; at exactly 30 fps it is 1.001 frames.
+  assert_eq!(
+    count_of(ntsc, seconds_of(1, Timebase::NTSC_VIDEO)),
+    Some((1, 1))
+  );
+  assert_eq!(
+    count_of(Rate::FPS_30, seconds_of(1, Timebase::NTSC_VIDEO)),
+    Some((1_001, 1_000))
+  );
+  // Backwards, the count is negative and keeps its fraction.
+  assert_eq!(
+    count_of(ntsc, seconds_of(-1, Timebase::SECONDS)),
+    Some((-30_000, 1_001))
+  );
+  // Lowest terms whatever the rate's spelling: 60000/2002 is 29.97, and
+  // 48/2 a millisecond is 3/125 of an event.
+  assert_eq!(
+    count_of(
+      Rate::fps(60_000, nz(2002)),
+      seconds_of(1, Timebase::SECONDS)
+    ),
+    Some((30_000, 1_001))
+  );
+  assert_eq!(
+    count_of(Rate::fps(48, nz(2)), seconds_of(1, Timebase::MILLIS)),
+    Some((3, 125))
+  );
+  // A 1/2 Hz rate: an event every two seconds.
+  let half = Rate::fps(1, nz(2));
+  assert_eq!(
+    count_of(half, seconds_of(3, Timebase::SECONDS)),
+    Some((3, 2))
+  );
+  assert_eq!(
+    count_of(half, seconds_of(4, Timebase::SECONDS)),
+    Some((2, 1))
+  );
+  assert_eq!(
+    count_of(half, seconds_of(-3, Timebase::SECONDS)),
+    Some((-3, 2))
+  );
+  // Samples: a millisecond at 48 kHz is 48 of them; an MPEG tick, 8/15 of one.
+  let audio = Rate::hz(48_000);
+  assert_eq!(
+    count_of(audio, seconds_of(1, Timebase::MILLIS)),
+    Some((48, 1))
+  );
+  assert_eq!(
+    count_of(audio, seconds_of(1, Timebase::MPEG_90K)),
+    Some((8, 15))
+  );
+  // No time counts no events, and a degenerate rate counts none in any time.
+  assert_eq!(count_of(ntsc, ExactSeconds::ZERO), Some((0, 1)));
+  assert_eq!(
+    count_of(Rate::hz(0), seconds_of(i64::MAX, Timebase::SECONDS)),
+    Some((0, 1))
+  );
+  assert_eq!(
+    count_of(Rate::fps(0, nz(7)), seconds_of(-5, Timebase::MILLIS)),
+    Some((0, 1))
+  );
+  // And it is usable where a constant is.
+  const FRAMES: Option<(i128, NonZeroI128)> = Rate::FPS_29_97.checked_count(
+    ExactSeconds::from_signed_duration(SignedDuration::new(1_001, Timebase::MILLIS)),
+  );
+  assert_eq!(FRAMES.map(|(n, d)| (n, d.get())), Some((30, 1)));
+}
+
+#[test]
+fn a_count_refuses_only_what_i128_cannot_hold() {
+  // About 2^95 seconds — u64::MAX ticks of i32::MAX seconds — counted at
+  // i32::MAX a second: twice that is under 2^127 events, three times is not.
+  let big = ExactSeconds::from_duration(Duration::new(u64::MAX, Timebase::new(i32::MAX, nz(1))));
+  let twice = big.checked_add(big).unwrap();
+  let thrice = twice.checked_add(big).unwrap();
+  let fastest = Rate::hz(i32::MAX);
+  assert_eq!(
+    count_of(fastest, twice),
+    Some((twice.num() * i32::MAX as i128, 1))
+  );
+  assert_eq!(count_of(fastest, thrice), None);
+  assert_eq!(
+    count_of(fastest, ExactSeconds::ZERO.checked_sub(thrice).unwrap()),
+    None
+  );
+  assert_eq!(count_of(Rate::hz(1), thrice), Some((thrice.num(), 1)));
+
+  // A denominator past i128: four ticks of near-coprime timebases near
+  // i32::MAX sum over a denominator near 2^123, and one event every
+  // i32::MAX - 4 seconds shares no factor with it.
+  let mut sum = ExactSeconds::ZERO;
+  for k in 0..4 {
+    sum = sum
+      .checked_add(seconds_of(1, Timebase::new(1, nz(i32::MAX - k))))
+      .unwrap();
+  }
+  assert!(sum.den().get() > (1_i128 << 120));
+  assert_eq!(count_of(Rate::fps(1, nz(i32::MAX - 4)), sum), None);
+}
+
+#[test]
+fn a_count_cancels_before_it_multiplies() {
+  // N/2 seconds, N = (2^64 - 1)(2^31 - 1) odd, three times over: 3N/2. At
+  // 2^31 - 2 events a second the plain product 3N·(2^31 - 2) is past 2^127,
+  // and the count 3N·(2^30 - 1) — the 2 cancelled first — is not.
+  let half = ExactSeconds::from_duration(Duration::new(u64::MAX, Timebase::new(i32::MAX, nz(2))));
+  let thrice = half
+    .checked_add(half)
+    .and_then(|s| s.checked_add(half))
+    .unwrap();
+  let n = (u64::MAX as i128) * (i32::MAX as i128);
+  assert_eq!((thrice.num(), thrice.den().get()), (3 * n, 2));
+  assert_eq!((3 * n).checked_mul(i32::MAX as i128 - 1), None);
+  assert_eq!(
+    count_of(Rate::hz(i32::MAX - 1), thrice),
+    Some((3 * n * ((1 << 30) - 1), 1))
+  );
 }
