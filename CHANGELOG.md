@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `TimeRange::span` — a range's length as a `Duration` in its own
+  timebase, exactly and total: every range keeps `start <= end`, and two
+  `i64` ends lie at most `u64::MAX` ticks apart, so nothing is refused,
+  clamped or rounded. `total_pts` still saturates at `i64::MAX` — so
+  `[i64::MIN, i64::MAX)` and `[0, i64::MAX)` measure alike there — and
+  `duration` still truncates at the nanosecond.
+- `TimeRange::coarsest_whole_rate` — the fewest whole ticks a second on
+  whose ticks a range's start and end both land, as the rate `r/1`:
+  `r = den / gcd(den, g·num)`, `g` the gcd of the two counts, exact in
+  `u128`. The whole rates that hold the range are exactly the multiples
+  of `r`; laws prove it over every range of a small box against every rate
+  up to three times its denominator, and over random ranges at full range.
+  `None` for a degenerate timebase.
+- `Rate::checked_count(seconds)` — the exact number of events at a rate in
+  an `ExactSeconds`, as a fraction in lowest terms `(i128, NonZeroI128)`,
+  or `None` where either half leaves `i128`. `ExactSeconds` reads a total
+  back only to a whole tick; this is the count before any rounding, its
+  denominator `1` exactly where the seconds land on an event. The rate is
+  reduced and the two fractions are cancelled crosswise before they are
+  multiplied, so `60000/2002` counts as `30000/1001` does. A degenerate
+  rate counts `(0, 1)`.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added
