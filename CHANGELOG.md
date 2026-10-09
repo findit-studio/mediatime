@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-10
+
 ### Added
 
 - `TimeRange::span` — a range's length as a `Duration` in its own
