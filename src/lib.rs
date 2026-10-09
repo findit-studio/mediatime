@@ -134,6 +134,7 @@ pub(crate) const DEN_ONE: NonZeroI32 = nz(1);
 /// | [`checked_pts_to_duration`](Self::checked_pts_to_duration), [`Duration::checked_to_std`], [`Timestamp::duration`] | zero — though the first still refuses a negative count for its sign |
 /// | [`checked_recip`](Self::checked_recip) and [`Rate`]'s reciprocal roads | `None` from the `checked_` ones, a panic from the rest: there is no reciprocal |
 /// | the `cmp_semantic`s, [`Timestamp`]'s `==`, the [`TimeRange`] predicates | every count names instant zero, or measures zero |
+/// | [`TimeRange::span`] | the counts' difference as written, `end - start` ticks of it, each measuring zero |
 /// | [`ExactSeconds`]'s `from_` roads, and its read-backs into it | zero, and `None` |
 /// | [`Timestamp::parse_seconds`] | [`ParseSecondsError::DegenerateTimebase`] |
 /// | [`Rate::as_f64`] | `0.0` |
@@ -2774,6 +2775,8 @@ impl TimeRange {
   /// Always non-negative given the `start <= end` constructor invariant.
   /// Saturates at `i64::MAX` in the pathological case where `end - start`
   /// would overflow `i64` (e.g., `start = i64::MIN`, `end = i64::MAX`).
+  /// [`Self::span`] is the same difference without the clamp, as a
+  /// [`Duration`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn total_pts(&self) -> i64 {
     self.end.saturating_sub(self.start)
@@ -2799,6 +2802,43 @@ impl TimeRange {
     }
     let nanos = (span % den) * NANOS_PER_SEC / den;
     StdDuration::new(secs as u64, nanos as u32)
+  }
+
+  /// The range's length as a [`Duration`] counted in its own timebase:
+  /// `end - start` ticks, exactly.
+  ///
+  /// Total: `start <= end` holds for every range there is — every
+  /// constructor, setter and decoder keeps it — so the difference is never
+  /// negative, and two `i64` endpoints lie at most `u64::MAX` ticks apart,
+  /// which is as far as a [`Duration`] counts. Nothing is refused, clamped
+  /// or rounded, which is what the two older measures cannot say:
+  /// [`Self::total_pts`] saturates at `i64::MAX`, so `[i64::MIN, i64::MAX)`
+  /// and `[0, i64::MAX)` measure alike there, and [`Self::duration`] is
+  /// truncated to the nanosecond.
+  ///
+  /// The timebase is the range's own, as written — a range over `2/2000`
+  /// spans ticks of `2/2000`. Under a degenerate `0/den` timebase the count
+  /// is still `end - start`, and each of its ticks measures zero, as every
+  /// [`Duration`] counted in one does.
+  ///
+  /// ```
+  /// use mediatime::{Duration, TimeRange, Timebase};
+  ///
+  /// let r = TimeRange::new(1_500, 3_250, Timebase::MILLIS);
+  /// assert_eq!(r.span(), Duration::new(1_750, Timebase::MILLIS));
+  ///
+  /// // The widest range there is: `total_pts` saturates, `span` does not.
+  /// let widest = TimeRange::new(i64::MIN, i64::MAX, Timebase::NANOS);
+  /// assert_eq!(widest.span().ticks(), u64::MAX);
+  /// assert_eq!(widest.total_pts(), i64::MAX);
+  /// ```
+  #[must_use]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn span(&self) -> Duration {
+    // In `[0, 2^64)`: the endpoints are ordered `i64`s, so their difference
+    // in `i128` is exact and fits a `u64`.
+    let ticks = (self.end as i128 - self.start as i128) as u64;
+    Duration::new(ticks, self.timebase)
   }
 
   /// Returns a new `TimeRange` representing the same span in a different timebase.

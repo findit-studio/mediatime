@@ -1970,6 +1970,66 @@ fn time_range_total_pts() {
 }
 
 #[test]
+fn a_ranges_span_is_its_length_in_its_own_timebase() {
+  let ms = Timebase::MILLIS;
+  assert_eq!(
+    TimeRange::new(1_500, 3_250, ms).span(),
+    Duration::new(1_750, ms)
+  );
+  // A negative start, and ranges of no length at either sign.
+  assert_eq!(
+    TimeRange::new(-90_000, 45_000, Timebase::MPEG_90K).span(),
+    Duration::new(135_000, Timebase::MPEG_90K)
+  );
+  assert!(TimeRange::new(-5, -5, ms).span().is_zero());
+  assert!(TimeRange::new(7, 7, ms).span().is_zero());
+  // The timebase as written: a range over 2/2000 spans ticks of 2/2000.
+  let doubled = Timebase::new(2, nz(2000));
+  let span = TimeRange::new(0, 3, doubled).span();
+  assert_eq!(span.ticks(), 3);
+  assert!(span.timebase().is_identical(&doubled));
+  // Counted, not measured: thirty NTSC frames, and seven ticks of a 1/2 Hz
+  // clock, which are fourteen seconds.
+  assert_eq!(
+    TimeRange::new(1, 31, Timebase::NTSC_VIDEO).span(),
+    Duration::new(30, Timebase::NTSC_VIDEO)
+  );
+  let two_seconds = Timebase::new(2, nz(1));
+  assert_eq!(
+    ExactSeconds::from_duration(TimeRange::new(-3, 4, two_seconds).span()),
+    ExactSeconds::from_signed_duration(SignedDuration::new(14, Timebase::SECONDS))
+  );
+}
+
+#[test]
+fn a_ranges_span_is_total_at_the_extremes() {
+  let ns = Timebase::NANOS;
+  // `total_pts` saturates at `i64::MAX`, so the widest range and `[0,
+  // i64::MAX)` measure alike there; the span tells them apart.
+  let widest = TimeRange::new(i64::MIN, i64::MAX, ns);
+  let longest_signed = TimeRange::new(0, i64::MAX, ns);
+  assert_eq!(widest.total_pts(), longest_signed.total_pts());
+  assert_eq!(widest.span(), Duration::new(u64::MAX, ns));
+  assert_eq!(longest_signed.span(), Duration::new(i64::MAX as u64, ns));
+  // One tick past `i64::MAX`: the first span a signed difference of the
+  // ends has no room for.
+  assert_eq!(
+    TimeRange::new(-1, i64::MAX, ns).span(),
+    Duration::new(1 << 63, ns)
+  );
+  assert!(TimeRange::new(i64::MIN, i64::MIN, ns).span().is_zero());
+  assert!(TimeRange::new(i64::MAX, i64::MAX, ns).span().is_zero());
+  // A degenerate timebase counts its ticks as written; they measure zero.
+  let zero = Timebase::new(0, nz(3));
+  let degenerate = TimeRange::new(i64::MIN, i64::MAX, zero).span();
+  assert_eq!(degenerate, Duration::new(u64::MAX, zero));
+  assert_eq!(ExactSeconds::from_duration(degenerate), ExactSeconds::ZERO);
+  // And it is usable where a constant is.
+  const SPAN: Duration = TimeRange::new(10, 25, Timebase::MILLIS).span();
+  const { assert!(SPAN.ticks() == 15) };
+}
+
+#[test]
 fn time_range_rescale_to() {
   let ms = Timebase::new(1, nz(1000));
   let mpeg = Timebase::new(1, nz(90_000));
@@ -2871,6 +2931,11 @@ fn the_degenerate_timebase_on_every_road() {
       .is_eq()
   );
   assert!(!TimeRange::new(1, 9, zero).contains_instant(&Timestamp::new(0, ms)));
+
+  // A range's span counts its ticks as written, each measuring zero.
+  let span = TimeRange::new(-5, 5, zero).span();
+  assert_eq!(span, Duration::new(10, zero));
+  assert_eq!(ExactSeconds::from_duration(span), ExactSeconds::ZERO);
 
   // Exact seconds, and parsing.
   assert_eq!(

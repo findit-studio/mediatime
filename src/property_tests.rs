@@ -894,4 +894,23 @@ quickcheck! {
     let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
     Some(range.duration()) == range.end().duration_since(&range.start())
   }
+
+  /// `span` is the checked difference of the ends wherever that answers —
+  /// `end.checked_signed_duration_since(&start)`, the road a caller measured
+  /// a range by before it — and answers on past it, exactly where that
+  /// difference leaves `i64`: up to `u64::MAX` ticks, as wide as two `i64`
+  /// ends can be. Counted in the range's own timebase as written, and the
+  /// exact seconds between the ends.
+  fn a_ranges_span_is_the_difference_of_its_ends(a: i64, b: i64, tb: (u32, u32)) -> bool {
+    let range = TimeRange::new(a.min(b), a.max(b), any_timebase(tb));
+    let span = range.span();
+    let signed = range.end().checked_signed_duration_since(&range.start());
+    let fits = span.ticks() <= i64::MAX as u64;
+    let between = ExactSeconds::from_timestamp(range.end())
+      .checked_sub(ExactSeconds::from_timestamp(range.start()));
+    span.ticks() as i128 == range.end_pts() as i128 - range.start_pts() as i128
+      && span.timebase().is_identical(&range.timebase())
+      && signed == fits.then(|| SignedDuration::new(span.ticks() as i64, range.timebase()))
+      && between == Some(ExactSeconds::from_duration(span))
+  }
 }
